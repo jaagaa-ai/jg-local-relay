@@ -6,6 +6,7 @@
 // (pm2 start/stop/restart, logs.tail, tunnel.start/stop, git.*, env.read/write).
 
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import os from 'node:os';
 
 function run(cmd, args, opts = {}) {
@@ -74,5 +75,58 @@ export const commands = {
     const bin = process.env.JG_PM2_BIN || 'pm2';
     const { stdout, stderr } = await run(bin, ['restart', name, '--update-env']);
     return { ok: true, name, stdout: stdout.slice(-400), stderr: stderr.slice(-400) };
+  },
+
+  // Git branch + dirty flag for a working tree. cp enriches LocalCard
+  // entries with these so the hosted dashboard shows the same branch
+  // chip the localhost manager does. Tolerates non-git or missing cwds
+  // by returning a soft `null` instead of throwing.
+  async 'git.branch'({ cwd } = {}) {
+    if (!cwd || typeof cwd !== 'string') throw new Error('git.branch requires `cwd`');
+    try {
+      const { stdout } = await run('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD'], { timeout: 4000 });
+      return { branch: stdout.trim() || null };
+    } catch { return { branch: null }; }
+  },
+
+  async 'git.dirty'({ cwd } = {}) {
+    if (!cwd || typeof cwd !== 'string') throw new Error('git.dirty requires `cwd`');
+    try {
+      const { stdout } = await run('git', ['-C', cwd, 'status', '--porcelain'], { timeout: 4000 });
+      return { dirty: stdout.trim().length > 0 };
+    } catch { return { dirty: false }; }
+  },
+
+  // Open a folder/file in the OS's native file browser. Used by the
+  // hosted Local-tab folder chip — without this, /api/open-folder ran
+  // against cp's container filesystem and was useless from the browser.
+  // Mac uses `open`, Linux uses `xdg-open`, Windows uses `explorer`.
+  async 'fs.open'({ path } = {}) {
+    if (!path || typeof path !== 'string') throw new Error('fs.open requires `path`');
+    const plat = process.platform;
+    const cmd = plat === 'darwin' ? 'open' : plat === 'win32' ? 'explorer' : 'xdg-open';
+    try {
+      await run(cmd, [path], { timeout: 4000 });
+      return { ok: true };
+    } catch (e) {
+      // `explorer` on Windows exits 1 even on success — treat as ok.
+      if (plat === 'win32') return { ok: true };
+      throw e;
+    }
+  },
+
+  // Cheap "does this path exist on the user's Mac?" check. cp uses it
+  // to decide whether to render `folder_open` (exists) vs `folder_off`
+  // (deleted) instead of forcing repo_status='ok' for every chip.
+  async 'fs.exists'({ path } = {}) {
+    if (!path || typeof path !== 'string') throw new Error('fs.exists requires `path`');
+    return { exists: existsSync(path) };
+  },
+
+  // Agent's own package.json version. cp polls this to decide whether
+  // a newer release is available and to surface "update available" in
+  // the relay pill.
+  async 'agent.version'() {
+    return { version: process.env.npm_package_version || '0.1.0' };
   },
 };
