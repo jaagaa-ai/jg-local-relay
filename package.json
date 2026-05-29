@@ -1,6 +1,6 @@
 {
   "name": "jg-local-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Thin agent that dials home to the Jaagaa control-plane (cp.jaagaa.ai) over WSS and executes local dev/ops commands on its behalf. Replaces the per-machine manager.",
