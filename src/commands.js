@@ -6,8 +6,18 @@
 // (pm2 start/stop/restart, logs.tail, tunnel.start/stop, git.*, env.read/write).
 
 import { execFile, spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import os from 'node:os';
+
+// Same package.json read as src/index.js — keeps a single source of
+// truth so `agent.version` matches what cp displays in the relay pill.
+const _pkgPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+const VERSION = (() => {
+  try { return JSON.parse(readFileSync(_pkgPath, 'utf8'))?.version || '0.0.0'; }
+  catch { return '0.0.0'; }
+})();
 
 // Track long-running background processes (tunnels, log tails) so we
 // can `pgrep`-list them, stop them by name, and clean up on disconnect.
@@ -129,9 +139,11 @@ export const commands = {
 
   // Agent's own package.json version. cp polls this to decide whether
   // a newer release is available and to surface "update available" in
-  // the relay pill.
+  // the relay pill. `npm_package_version` is only set when run via npm
+  // lifecycle scripts (start/dev), NOT under launchd/systemd — so the
+  // previous fallback "0.3.0" was being reported forever in prod.
   async 'agent.version'() {
-    return { version: process.env.npm_package_version || '0.3.0' };
+    return { version: VERSION };
   },
 
   // Streaming pm2 log tail. Spawns `pm2 logs NAME --raw --lines 0` and
