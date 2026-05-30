@@ -13,13 +13,24 @@
 
 import WebSocket from 'ws';
 import os from 'node:os';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { commands } from './commands.js';
 
 const CP_URL = process.env.JG_CP_URL || 'ws://localhost:7090/relay';
 const TOKEN = process.env.JG_RELAY_TOKEN || '';
 const RELAY_ID = process.env.JG_RELAY_ID || os.hostname();
 const PROJECTS = (process.env.JG_RELAY_PROJECTS || '').split(',').map((s) => s.trim()).filter(Boolean);
-const VERSION = '0.1.0';
+// Read VERSION from package.json so a single bump there propagates here AND
+// into the bundle cp serves. The earlier hardcoded `0.1.0` constant was
+// silently stale through 0.2.0/0.3.0 — installed agents kept reporting 0.1.0
+// to cp, which then incorrectly flagged every install as "outdated".
+const _pkgPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+const VERSION = (() => {
+  try { return JSON.parse(readFileSync(_pkgPath, 'utf8'))?.version || '0.0.0'; }
+  catch { return '0.0.0'; }
+})();
 const HEARTBEAT_MS = 25_000;
 const MAX_BACKOFF_MS = 30_000;
 
