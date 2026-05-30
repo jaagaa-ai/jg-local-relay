@@ -159,7 +159,11 @@ export const commands = {
     const key = `logs:${name}`;
     const prev = _backgroundProcs.get(key);
     if (prev) { try { prev.kill('SIGTERM'); } catch (_) {} }
-    const child = spawn(bin, ['logs', name, '--raw', '--lines', '0'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // --lines 100 flushes the last 100 historical lines BEFORE following new
+    // ones. With --lines 0 (the prior default) pm2 only emitted brand-new
+    // lines, so the user saw "waiting for log lines…" whenever the proc
+    // was idle — even when the log file was full of useful past output.
+    const child = spawn(bin, ['logs', name, '--raw', '--lines', '100'], { stdio: ['ignore', 'pipe', 'pipe'] });
     _backgroundProcs.set(key, child);
     // Without this, a missing pm2 binary fires 'error' on the child and —
     // because spawn has no default error handler — crashes the whole relay
