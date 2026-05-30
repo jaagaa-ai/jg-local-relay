@@ -6,10 +6,87 @@
 // (pm2 start/stop/restart, logs.tail, tunnel.start/stop, git.*, env.read/write).
 
 import { execFile, spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, watch as fsWatch } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
+
+// Per-cwd fs.watch state for git.status push notifications. Keyed by
+// cwd. Each entry: { watchers:FSWatcher[], debounce:Timeout|null, ctx,
+// last:{branch,dirty,ahead,behind} }. Only one watcher per cwd no
+// matter how many cp clients ask for git.status — re-issuing on the
+// same cwd just refreshes the ctx so cp's latest connection wins.
+const _gitWatchers = new Map();
+
+async function _probeGitStatus(cwd) {
+  const out = { branch: null, dirty: false, ahead: 0, behind: 0 };
+  try {
+    const br = await run('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD'], { timeout: 4000 });
+    out.branch = br.stdout.trim() || null;
+  } catch (_) { /* non-git cwd is fine */ }
+  try {
+    const pc = await run('git', ['-C', cwd, 'status', '--porcelain'], { timeout: 4000 });
+    out.dirty = pc.stdout.trim().length > 0;
+  } catch (_) {}
+  try {
+    const rl = await run('git', ['-C', cwd, 'rev-list', '--left-right', '--count', '@{u}...HEAD'], { timeout: 4000 });
+    const [behind, ahead] = rl.stdout.trim().split(/\s+/).map((n) => parseInt(n, 10) || 0);
+    out.behind = behind || 0;
+    out.ahead = ahead || 0;
+  } catch (_) {}
+  return out;
+}
+
+function _startGitWatcher(cwd, ctx, initial) {
+  const existing = _gitWatchers.get(cwd);
+  if (existing) {
+    existing.ctx = ctx;
+    existing.last = initial;
+    return;
+  }
+  const watchers = [];
+  // Watch points: .git/HEAD (branch switches), .git/index (staged/unstaged
+  // changes), .git/refs (commits/fetches). fs.watch on macOS uses FSEvents
+  // — cheap and silent until something changes.
+  const gitDir = path.join(cwd, '.git');
+  if (!existsSync(gitDir)) return; // non-git cwd
+  const targets = [
+    path.join(gitDir, 'HEAD'),
+    path.join(gitDir, 'index'),
+    path.join(gitDir, 'refs'),
+  ];
+  const state = { watchers, debounce: null, ctx, last: initial };
+  _gitWatchers.set(cwd, state);
+  const fire = () => {
+    if (state.debounce) clearTimeout(state.debounce);
+    // 400ms debounce — git operations touch multiple files in quick
+    // succession (HEAD + index + refs/heads/main can flip all at once
+    // on a `git pull`). Without this we'd fire 3-5 redundant probes
+    // per single user action.
+    state.debounce = setTimeout(async () => {
+      state.debounce = null;
+      try {
+        const next = await _probeGitStatus(cwd);
+        // Only push if something actually changed — avoids waking cp
+        // for fs.watch noise like .git/index lock file flickering.
+        const prev = state.last;
+        if (next.branch !== prev.branch || next.dirty !== prev.dirty ||
+            next.ahead !== prev.ahead || next.behind !== prev.behind) {
+          state.last = next;
+          try { state.ctx?.send?.({ type: 'git-status', cwd, ...next }); } catch (_) {}
+        }
+      } catch (_) {}
+    }, 400);
+  };
+  for (const t of targets) {
+    try {
+      // recursive:true so .git/refs/heads/* changes also bubble up.
+      const w = fsWatch(t, { persistent: false, recursive: t.endsWith('refs') }, fire);
+      w.on('error', () => {});
+      watchers.push(w);
+    } catch (_) {}
+  }
+}
 
 // Same package.json read as src/index.js — keeps a single source of
 // truth so `agent.version` matches what cp displays in the relay pill.
@@ -111,30 +188,17 @@ export const commands = {
     } catch { return { dirty: false }; }
   },
 
-  // Combined branch + dirty + ahead/behind probe in a single relay round-
-  // trip — cp's per-cwd poller calls this every 10s and caches the result
-  // so mapPm2Process can render branch/dirty/ahead/behind chips on every
-  // Local card without making three separate WSS calls per process.
-  async 'git.status'({ cwd } = {}) {
+  // Push-only git status. Returns an initial snapshot + sets up an
+  // fs.watch on .git/HEAD + .git/index so the relay can push a frame
+  // when (and ONLY when) the user's repo state actually changes —
+  // a branch switch, a commit, a `git pull`, a file save that flips
+  // dirty/clean. cp registers a consumer keyed by command id and
+  // updates its cache off the pushed frames; zero polling either side.
+  async 'git.status'({ cwd } = {}, ctx) {
     if (!cwd || typeof cwd !== 'string') throw new Error('git.status requires `cwd`');
-    const out = { branch: null, dirty: false, ahead: 0, behind: 0 };
-    try {
-      const br = await run('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD'], { timeout: 4000 });
-      out.branch = br.stdout.trim() || null;
-    } catch (_) { /* tolerate non-git cwds */ }
-    try {
-      const pc = await run('git', ['-C', cwd, 'status', '--porcelain'], { timeout: 4000 });
-      out.dirty = pc.stdout.trim().length > 0;
-    } catch (_) {}
-    try {
-      // `rev-list --left-right --count @{u}...HEAD` returns "<behind>\t<ahead>"
-      // when an upstream is set; falls through to zeros otherwise.
-      const rl = await run('git', ['-C', cwd, 'rev-list', '--left-right', '--count', '@{u}...HEAD'], { timeout: 4000 });
-      const [behind, ahead] = rl.stdout.trim().split(/\s+/).map((n) => parseInt(n, 10) || 0);
-      out.behind = behind || 0;
-      out.ahead = ahead || 0;
-    } catch (_) {}
-    return out;
+    const initial = await _probeGitStatus(cwd);
+    _startGitWatcher(cwd, ctx, initial);
+    return initial;
   },
 
   // Open a folder/file in the OS's native file browser. Used by the
