@@ -100,6 +100,50 @@ const VERSION = (() => {
 // can `pgrep`-list them, stop them by name, and clean up on disconnect.
 const _backgroundProcs = new Map(); // key → child_process
 
+// Per-tunnel ring buffer of recent stdout/stderr lines so a subscriber
+// arriving after tunnel.start gets the last ~200 lines as history
+// (parity with pm2.logs.tail's --lines 100 behavior). Each entry is
+// {stream:'out'|'err', line:string}.
+const _tunnelLogBuffers = new Map(); // name → Array<{stream, line}>
+const _TUNNEL_LOG_CAP   = 200;
+
+// Live subscribers per tunnel. tunnel.start fans every new line out to
+// every entry in the matching set. Each entry is {ctx, send} where send
+// is a pre-bound `(stream, line) => ctx.send({type:'log', id, stream, line})`.
+const _tunnelLogSubs = new Map(); // name → Set<{ctx, send}>
+
+// Parse the cloudflared tunnel name out of a full command line.
+// cloudflared accepts:
+//   `cloudflared tunnel run <NAME>`
+//   `cloudflared tunnel run --url http://localhost:7050 <NAME>`
+//   `cloudflared tunnel --config <path> run <NAME>`
+//   `cloudflared tunnel --credentials-file <path> run --url http://... <UUID>`
+//   `cloudflared tunnel run --name <NAME>` (rare)
+// The tunnel name is the LAST positional argument after `run` (a token
+// that isn't a flag and doesn't follow a flag that takes a value).
+function _parseCloudflaredTunnelName(cmd) {
+  const runIdx = cmd.search(/\srun(\s|$)/);
+  if (runIdx < 0) {
+    const m = cmd.match(/--name[=\s]+(\S+)/);
+    return m ? m[1] : null;
+  }
+  const tail = cmd.slice(runIdx).trim().split(/\s+/).slice(1); // drop the "run"
+  let last = null;
+  for (let i = 0; i < tail.length; i++) {
+    const t = tail[i];
+    if (t.startsWith('--')) {
+      // Flag — consume its value if the next token isn't itself a flag.
+      // `--flag=value` carries its value inline; assume next is unrelated.
+      if (!t.includes('=') && i + 1 < tail.length && !tail[i + 1].startsWith('--')) {
+        i++;
+      }
+      continue;
+    }
+    last = t;
+  }
+  return last;
+}
+
 function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
     execFile(cmd, args, { timeout: 15000, maxBuffer: 8 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
@@ -377,21 +421,28 @@ export const commands = {
   },
 
   // Tunnel management — relays' Mac runs cloudflared. We track named
-  // tunnels we've spawned ourselves and parse pgrep to surface any
+  // tunnels we've spawned ourselves and parse ps to surface any
   // pre-existing cloudflared processes the user started outside cp.
+  //
+  // NOTE: `pgrep -af` on macOS does NOT include command-line arguments
+  // (the `-a` flag is only honored on Linux), so the previous
+  // implementation never detected externally-spawned tunnels on the
+  // platform we run on. `ps -axo pid=,command=` is portable across
+  // macOS + Linux and gives us the full argv.
   async 'tunnel.list'() {
-    const out = await run('pgrep', ['-af', 'cloudflared']).catch(() => ({ stdout: '' }));
+    const out = await run('ps', ['-axo', 'pid=,command=']).catch(() => ({ stdout: '' }));
     const lines = (out.stdout || '').split(/\r?\n/).filter(Boolean);
     const tunnels = [];
-    for (const line of lines) {
-      const [pidStr, ...rest] = line.split(/\s+/);
-      const cmd = rest.join(' ');
-      // Match `cloudflared tunnel run <NAME>` or `--name <NAME>`.
-      const m = cmd.match(/tunnel\s+(?:--config\s+\S+\s+)?run\s+([^\s]+)/)
-             || cmd.match(/--name\s+([^\s]+)/);
-      if (m) tunnels.push({ pid: parseInt(pidStr, 10), name: m[1], running: true });
+    for (const rawLine of lines) {
+      const m0 = rawLine.match(/^\s*(\d+)\s+(.*)$/);
+      if (!m0) continue;
+      const pid = parseInt(m0[1], 10);
+      const cmd = m0[2];
+      if (!/(^|\/)cloudflared(\s|$)/.test(cmd)) continue;
+      const name = _parseCloudflaredTunnelName(cmd);
+      if (name) tunnels.push({ pid, name, running: true });
     }
-    // Add any tracked tunnels that pgrep missed (race condition).
+    // Add any tracked tunnels that ps missed (race condition).
     for (const [key, child] of _backgroundProcs) {
       if (!key.startsWith('tunnel:')) continue;
       const name = key.slice('tunnel:'.length);
@@ -400,6 +451,40 @@ export const commands = {
       }
     }
     return { tunnels };
+  },
+
+  // tunnel.logs.tail({name}) — subscribe to live cloudflared stdout/stderr
+  // for a tunnel WE spawned. Replays the in-memory buffer first (last
+  // ~200 lines), then forwards every new line as `{type:'log', stream, line}`
+  // frames over the same ctx.send pipe pm2.logs.tail uses, so cp's WS
+  // handler can fan them out to the dashboard's tunnel-log pane.
+  // Multiple subscribers (browsers) per tunnel are supported.
+  async 'tunnel.logs.tail'({ name } = {}, ctx) {
+    if (!name || typeof name !== 'string') throw new Error('tunnel.logs.tail requires `name`');
+    const cmdId = ctx?.id;
+    const send = (stream, line) => {
+      try { ctx?.send?.({ type: 'log', id: cmdId, stream, line }); } catch (_) {}
+    };
+    // Replay buffered history
+    const buf = _tunnelLogBuffers.get(name);
+    if (buf) for (const { stream, line } of buf) send(stream, line);
+    // Register live subscriber
+    if (!_tunnelLogSubs.has(name)) _tunnelLogSubs.set(name, new Set());
+    const entry = { ctx, send };
+    _tunnelLogSubs.get(name).add(entry);
+    // Stash a per-ctx unsubscribe so tunnel.logs.stop can find it.
+    if (!ctx._tunnelLogEntries) ctx._tunnelLogEntries = new Map();
+    ctx._tunnelLogEntries.set(name, entry);
+    return { ok: true, name, streaming: true };
+  },
+
+  async 'tunnel.logs.stop'({ name } = {}, ctx) {
+    if (!name) throw new Error('tunnel.logs.stop requires `name`');
+    const subs = _tunnelLogSubs.get(name);
+    const entry = ctx?._tunnelLogEntries?.get(name);
+    if (subs && entry) subs.delete(entry);
+    if (ctx?._tunnelLogEntries) ctx._tunnelLogEntries.delete(name);
+    return { ok: true, stopped: true };
   },
 
   async 'tunnel.start'({ name, url } = {}) {
@@ -424,6 +509,24 @@ export const commands = {
       _backgroundProcs.delete(key);
       console.log(`[tunnel] ${name} exited code=${code}`);
     });
+    // Fan out stdout/stderr to the ring buffer + every live subscriber.
+    // Without this, the dashboard's "tunnel: jg-web" log pane just shows
+    // "waiting for log lines…" forever — even though cloudflared is
+    // happily logging connection registrations.
+    const fanout = (stream) => (chunk) => {
+      const lines = chunk.toString('utf8').split(/\r?\n/);
+      for (const line of lines) {
+        if (!line) continue;
+        const buf = _tunnelLogBuffers.get(name) || [];
+        buf.push({ stream, line });
+        if (buf.length > _TUNNEL_LOG_CAP) buf.splice(0, buf.length - _TUNNEL_LOG_CAP);
+        _tunnelLogBuffers.set(name, buf);
+        const subs = _tunnelLogSubs.get(name);
+        if (subs) for (const { send } of subs) send(stream, line);
+      }
+    };
+    child.stdout.on('data', fanout('out'));
+    child.stderr.on('data', fanout('err'));
     return { ok: true, name, url: url || null, pid: child.pid };
   },
 
