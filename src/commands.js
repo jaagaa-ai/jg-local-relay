@@ -5,9 +5,13 @@
 // Start small + safe; grow this to full parity with the manager's local actions
 // (pm2 start/stop/restart, logs.tail, tunnel.start/stop, git.*, env.read/write).
 
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
+
+// Track long-running background processes (tunnels, log tails) so we
+// can `pgrep`-list them, stop them by name, and clean up on disconnect.
+const _backgroundProcs = new Map(); // key → child_process
 
 function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
@@ -127,6 +131,99 @@ export const commands = {
   // a newer release is available and to surface "update available" in
   // the relay pill.
   async 'agent.version'() {
-    return { version: process.env.npm_package_version || '0.1.0' };
+    return { version: process.env.npm_package_version || '0.3.0' };
+  },
+
+  // Streaming pm2 log tail. Spawns `pm2 logs NAME --raw --lines 0` and
+  // forwards stdout/stderr line by line via ctx.send({type:'log', line})
+  // frames. ctx is the same object the WSS handler uses, so cp can
+  // forward each frame to the dashboard's /logs websocket.
+  // Single concurrent stream per process name — re-issuing kills the
+  // prior tail. Returns immediately; ctx.send keeps emitting until
+  // pm2.logs.stop or relay disconnect.
+  async 'pm2.logs.tail'({ name } = {}, ctx) {
+    if (!name || typeof name !== 'string') throw new Error('pm2.logs.tail requires `name`');
+    const bin = process.env.JG_PM2_BIN || 'pm2';
+    const key = `logs:${name}`;
+    const prev = _backgroundProcs.get(key);
+    if (prev) { try { prev.kill('SIGTERM'); } catch (_) {} }
+    const child = spawn(bin, ['logs', name, '--raw', '--lines', '0'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    _backgroundProcs.set(key, child);
+    // Include the command id in every log frame so cp can correlate
+    // multiple concurrent log tails to the right WSS client.
+    const cmdId = ctx?.id;
+    const onLine = (stream) => (chunk) => {
+      const lines = chunk.toString('utf8').split(/\r?\n/);
+      for (const line of lines) {
+        if (!line) continue;
+        try { ctx?.send?.({ type: 'log', id: cmdId, stream, line }); } catch (_) {}
+      }
+    };
+    child.stdout.on('data', onLine('out'));
+    child.stderr.on('data', onLine('err'));
+    child.on('exit', () => { _backgroundProcs.delete(key); });
+    return { ok: true, name, streaming: true };
+  },
+
+  async 'pm2.logs.stop'({ name } = {}) {
+    if (!name) throw new Error('pm2.logs.stop requires `name`');
+    const c = _backgroundProcs.get(`logs:${name}`);
+    if (!c) return { ok: true, stopped: false };
+    try { c.kill('SIGTERM'); } catch (_) {}
+    _backgroundProcs.delete(`logs:${name}`);
+    return { ok: true, stopped: true };
+  },
+
+  // Tunnel management — relays' Mac runs cloudflared. We track named
+  // tunnels we've spawned ourselves and parse pgrep to surface any
+  // pre-existing cloudflared processes the user started outside cp.
+  async 'tunnel.list'() {
+    const out = await run('pgrep', ['-af', 'cloudflared']).catch(() => ({ stdout: '' }));
+    const lines = (out.stdout || '').split(/\r?\n/).filter(Boolean);
+    const tunnels = [];
+    for (const line of lines) {
+      const [pidStr, ...rest] = line.split(/\s+/);
+      const cmd = rest.join(' ');
+      // Match `cloudflared tunnel run <NAME>` or `--name <NAME>`.
+      const m = cmd.match(/tunnel\s+(?:--config\s+\S+\s+)?run\s+([^\s]+)/)
+             || cmd.match(/--name\s+([^\s]+)/);
+      if (m) tunnels.push({ pid: parseInt(pidStr, 10), name: m[1], running: true });
+    }
+    // Add any tracked tunnels that pgrep missed (race condition).
+    for (const [key, child] of _backgroundProcs) {
+      if (!key.startsWith('tunnel:')) continue;
+      const name = key.slice('tunnel:'.length);
+      if (!tunnels.some(t => t.name === name)) {
+        tunnels.push({ pid: child.pid, name, running: child.exitCode === null });
+      }
+    }
+    return { tunnels };
+  },
+
+  async 'tunnel.start'({ name } = {}) {
+    if (!name || typeof name !== 'string') throw new Error('tunnel.start requires `name`');
+    const key = `tunnel:${name}`;
+    if (_backgroundProcs.has(key)) return { ok: true, alreadyRunning: true, name };
+    const bin = process.env.JG_CLOUDFLARED_BIN || 'cloudflared';
+    const child = spawn(bin, ['tunnel', 'run', name], { stdio: ['ignore', 'pipe', 'pipe'], detached: false });
+    _backgroundProcs.set(key, child);
+    child.on('exit', (code) => {
+      _backgroundProcs.delete(key);
+      console.log(`[tunnel] ${name} exited code=${code}`);
+    });
+    return { ok: true, name, pid: child.pid };
+  },
+
+  async 'tunnel.stop'({ name } = {}) {
+    if (!name) throw new Error('tunnel.stop requires `name`');
+    const child = _backgroundProcs.get(`tunnel:${name}`);
+    if (child) {
+      try { child.kill('SIGTERM'); } catch (_) {}
+      _backgroundProcs.delete(`tunnel:${name}`);
+      return { ok: true, stopped: true, name };
+    }
+    // Not started by us — try pkill by name.
+    await run('pkill', ['-f', `cloudflared.*${name}`]).catch(() => {});
+    return { ok: true, stopped: true, name, viaPkill: true };
   },
 };
