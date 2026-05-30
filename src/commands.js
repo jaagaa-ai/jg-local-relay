@@ -111,6 +111,32 @@ export const commands = {
     } catch { return { dirty: false }; }
   },
 
+  // Combined branch + dirty + ahead/behind probe in a single relay round-
+  // trip — cp's per-cwd poller calls this every 10s and caches the result
+  // so mapPm2Process can render branch/dirty/ahead/behind chips on every
+  // Local card without making three separate WSS calls per process.
+  async 'git.status'({ cwd } = {}) {
+    if (!cwd || typeof cwd !== 'string') throw new Error('git.status requires `cwd`');
+    const out = { branch: null, dirty: false, ahead: 0, behind: 0 };
+    try {
+      const br = await run('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD'], { timeout: 4000 });
+      out.branch = br.stdout.trim() || null;
+    } catch (_) { /* tolerate non-git cwds */ }
+    try {
+      const pc = await run('git', ['-C', cwd, 'status', '--porcelain'], { timeout: 4000 });
+      out.dirty = pc.stdout.trim().length > 0;
+    } catch (_) {}
+    try {
+      // `rev-list --left-right --count @{u}...HEAD` returns "<behind>\t<ahead>"
+      // when an upstream is set; falls through to zeros otherwise.
+      const rl = await run('git', ['-C', cwd, 'rev-list', '--left-right', '--count', '@{u}...HEAD'], { timeout: 4000 });
+      const [behind, ahead] = rl.stdout.trim().split(/\s+/).map((n) => parseInt(n, 10) || 0);
+      out.behind = behind || 0;
+      out.ahead = ahead || 0;
+    } catch (_) {}
+    return out;
+  },
+
   // Open a folder/file in the OS's native file browser. Used by the
   // hosted Local-tab folder chip — without this, /api/open-folder ran
   // against cp's container filesystem and was useless from the browser.
