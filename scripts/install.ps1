@@ -47,12 +47,14 @@ Invoke-WebRequest -Uri $SrcUrl -OutFile $Tarball -UseBasicParsing
 # tar is shipped in Win10+; expand into $Prefix.
 tar -xzf $Tarball -C $Prefix
 
-Write-Host "-> Installing Node dependencies"
+Write-Host "-> Installing Node dependencies (pm2 + ws — this can take 10-30s)"
 # pm2 is a hard dep of jg-local-relay (see its package.json), so this single
 # install also brings pm2 into $Prefix\node_modules — no separate global
 # install step. JG_PM2_BIN below pins the relay to this local copy.
+# --silent dropped: with pm2 the install pulls many packages and went
+# minutes-mute, looking hung. --loglevel=warn keeps the output sane.
 Push-Location $Prefix
-& npm install --omit=dev --no-fund --no-audit --silent
+& npm install --omit=dev --no-fund --no-audit --loglevel=warn
 Pop-Location
 
 # Local pm2 binary owned by this relay install. npm on Windows writes a

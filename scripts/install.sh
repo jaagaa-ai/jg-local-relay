@@ -81,11 +81,15 @@ BUNDLE_VERSION="$(tar -xzOf "$TMP/bundle.tar.gz" package.json 2>/dev/null | sed 
 echo "→ Bundle version: ${BUNDLE_VERSION:-unknown}"
 tar -xzf "$TMP/bundle.tar.gz" -C "$PREFIX"
 
-echo "→ Installing Node dependencies"
+echo "→ Installing Node dependencies (pm2 + ws — this can take 10-30s)"
 # pm2 ships as a hard dependency in the relay's package.json, so this single
 # `npm install` brings it in alongside ws — no separate `npm i -g pm2` step
 # and no PATH dance. Resolved binary path goes into JG_PM2_BIN below.
-( cd "$PREFIX" && npm install --omit=dev --no-fund --no-audit --silent )
+# NOTE: --silent removed deliberately. With pm2 added the install pulls
+# ~138 packages and takes 10-30s; under --silent npm emitted zero output
+# during that window and users mistook it for a network hang. Real npm
+# progress is louder but obviously alive.
+( cd "$PREFIX" && npm install --omit=dev --no-fund --no-audit --loglevel=warn )
 
 # Local pm2 binary — owned by this relay install, isolated from any global
 # pm2 the user may (or may not) have. The relay reads JG_PM2_BIN at spawn
