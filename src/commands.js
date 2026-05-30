@@ -160,6 +160,87 @@ function _pushSelfLog(stream, raw) {
   console.error = (...args) => { _pushSelfLog('err', fmt(args)); origErr(...args); };
 })();
 
+// Build the platform-specific helper script for relay self-management.
+// Each script: (1) waits ~2s so the relay ACK can land, (2) performs the
+// launchctl / systemctl / schtasks operation, (3) for uninstall also wipes
+// installed files + logs. Returns { interpreter, args } describing how to
+// spawn it.
+function _selfMgmtScript(op) {
+  const platform = process.platform;
+  if (platform === 'darwin') {
+    // macOS LaunchAgent uid = process.getuid(); fall back to env if needed.
+    const uid = (typeof process.getuid === 'function' && process.getuid()) || process.env.UID || 501;
+    const LABEL = 'ai.jaagaa.localrelay';
+    const PLIST = `${os.homedir()}/Library/LaunchAgents/${LABEL}.plist`;
+    const APP   = `${os.homedir()}/Library/Application Support/jg-local-relay`;
+    const LOGS  = `${os.homedir()}/Library/Logs/jg-local-relay`;
+    let body = '';
+    if (op === 'restart') {
+      // kickstart -k = stop-then-start; KeepAlive brings it back if it dies.
+      body = `launchctl kickstart -k gui/${uid}/${LABEL}`;
+    } else if (op === 'stop') {
+      // bootout cancels the agent for THIS session; disable persists across
+      // logins so KeepAlive doesn't immediately respawn it on next login.
+      body = `launchctl bootout gui/${uid}/${LABEL} 2>/dev/null; launchctl disable gui/${uid}/${LABEL} 2>/dev/null`;
+    } else if (op === 'uninstall') {
+      body = `launchctl bootout gui/${uid}/${LABEL} 2>/dev/null; rm -f '${PLIST}'; rm -rf '${APP}'; rm -rf '${LOGS}'`;
+    }
+    return {
+      interpreter: '/bin/sh',
+      args: ['-c', `(sleep 2; ${body}) &`],
+    };
+  }
+  if (platform === 'linux') {
+    const UNIT = 'jg-local-relay.service';
+    let body = '';
+    if (op === 'restart') body = `systemctl --user restart ${UNIT}`;
+    else if (op === 'stop') body = `systemctl --user stop ${UNIT}; systemctl --user disable ${UNIT}`;
+    else if (op === 'uninstall') {
+      const UNITF = `${os.homedir()}/.config/systemd/user/${UNIT}`;
+      const APP   = `${os.homedir()}/.local/share/jg-local-relay`;
+      const LOGS  = `${os.homedir()}/.local/state/jg-local-relay`;
+      body = `systemctl --user disable --now ${UNIT} 2>/dev/null; rm -f '${UNITF}'; rm -rf '${APP}'; rm -rf '${LOGS}'; systemctl --user daemon-reload`;
+    }
+    return {
+      interpreter: '/bin/sh',
+      args: ['-c', `(sleep 2; ${body}) &`],
+    };
+  }
+  if (platform === 'win32') {
+    const TASK = 'JgLocalRelay';
+    const APP  = `${process.env.LOCALAPPDATA}\\jg-local-relay`;
+    let body = '';
+    if (op === 'restart') {
+      body = `schtasks /End /TN "${TASK}"; Start-Sleep -Seconds 1; schtasks /Run /TN "${TASK}"`;
+    } else if (op === 'stop') {
+      body = `schtasks /End /TN "${TASK}"; schtasks /Change /TN "${TASK}" /DISABLE`;
+    } else if (op === 'uninstall') {
+      body = `schtasks /End /TN "${TASK}" 2>$null; schtasks /Delete /TN "${TASK}" /F 2>$null; Remove-Item -Recurse -Force "${APP}" -ErrorAction SilentlyContinue`;
+    }
+    return {
+      interpreter: 'powershell.exe',
+      args: ['-NoProfile', '-Command', `Start-Sleep -Seconds 2; ${body}`],
+    };
+  }
+  throw new Error(`unsupported platform: ${platform}`);
+}
+
+function _spawnSelfMgmtScript(op, script) {
+  // Fully detach so the helper outlives this relay process. unref() lets
+  // the relay exit naturally if the script's parent group is gone, and
+  // stdio:'ignore' decouples its file descriptors from ours.
+  try {
+    const child = spawn(script.interpreter, script.args, {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    return { ok: true, op, scheduled: true, willTerminate: op !== 'restart' || process.platform !== 'darwin' };
+  } catch (err) {
+    return { ok: false, op, error: err.message };
+  }
+}
+
 // Parse the cloudflared tunnel name out of a full command line.
 // cloudflared accepts:
 //   `cloudflared tunnel run <NAME>`
@@ -558,6 +639,26 @@ export const commands = {
     if (entry) _selfLogSubs.delete(entry);
     if (ctx) delete ctx._selfLogEntry;
     return { ok: true, stopped: true };
+  },
+
+  // ── Self-management (restart / stop / uninstall) ────────────────────────────
+  // The relay can't reliably run these inline because they involve killing
+  // the relay process. We spawn a detached helper script that sleeps for
+  // ~2s (long enough for the relay to ACK back to cp + cleanly close the
+  // WebSocket), THEN performs the launchctl / systemctl / schtasks call.
+  //
+  // Mac auto-relaunches via the LaunchAgent's KeepAlive=true after bootout —
+  // for "restart" that's what we want; for "stop" the same agent would
+  // immediately respawn it, so stop also disables the agent until next
+  // boot via `launchctl disable` (re-enable on next install).
+  async 'relay.restart'() {
+    return _spawnSelfMgmtScript('restart', _selfMgmtScript('restart'));
+  },
+  async 'relay.stop'() {
+    return _spawnSelfMgmtScript('stop', _selfMgmtScript('stop'));
+  },
+  async 'relay.uninstall'() {
+    return _spawnSelfMgmtScript('uninstall', _selfMgmtScript('uninstall'));
   },
 
   async 'tunnel.start'({ name, url } = {}) {
