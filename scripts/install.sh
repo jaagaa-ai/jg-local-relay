@@ -74,6 +74,11 @@ else
   echo "jg-local-relay: neither curl nor wget available — aborting." >&2
   exit 1
 fi
+# Surface the bundle's version BEFORE we extract — if a stale cp serves an
+# older bundle we want it in the install log, not silent under a "0.x.y" we
+# can't trace.
+BUNDLE_VERSION="$(tar -xzOf "$TMP/bundle.tar.gz" package.json 2>/dev/null | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' | head -1)"
+echo "→ Bundle version: ${BUNDLE_VERSION:-unknown}"
 tar -xzf "$TMP/bundle.tar.gz" -C "$PREFIX"
 
 echo "→ Installing Node dependencies"
@@ -159,9 +164,11 @@ fi
 # Brief handshake verification — tail the log for the "connected" line.
 echo "→ Verifying handshake…"
 i=0
+INSTALLED_VERSION="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$PREFIX/package.json" 2>/dev/null | head -1)"
 while [ "$i" -lt 10 ]; do
   if grep -q "registered with cp" "$LOG_DIR/out.log" 2>/dev/null; then
     echo "✔ Connected to $CP_URL as \"$RELAY_ID\" (projects: ${PROJECTS:-all})"
+    echo "✔ Installed version: ${INSTALLED_VERSION:-unknown} at $PREFIX"
     exit 0
   fi
   sleep 1
