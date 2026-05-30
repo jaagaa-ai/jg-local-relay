@@ -112,6 +112,54 @@ const _TUNNEL_LOG_CAP   = 200;
 // is a pre-bound `(stream, line) => ctx.send({type:'log', id, stream, line})`.
 const _tunnelLogSubs = new Map(); // name → Set<{ctx, send}>
 
+// ─── Self-log buffer ─────────────────────────────────────────────────────────
+// Capture the relay's own stdout/stderr (everything its `log()`, `console.log`,
+// `console.warn`, `console.error` calls produce) into an in-memory ring buffer
+// and fan it out to any active relay.logs.tail subscriber. Lets the dashboard's
+// log pane show "what the relay itself is doing" — install issues, command
+// errors, reconnect chatter — without the user SSH'ing into ~/Library/Logs.
+//
+// The console patch is a side effect at module load so anything that prints
+// after this file is `require()`d gets captured. Early boot lines (before
+// commands.js loads) are NOT captured — they're only in the launchd file
+// logs. In practice this misses the first ~100ms of startup, which is fine.
+const _selfLogBuffer = [];      // Array<{stream, line, ts}>
+const _SELF_LOG_CAP  = 500;
+const _selfLogSubs   = new Set(); // Set<{ctx, send}>
+
+function _pushSelfLog(stream, raw) {
+  // Split on newlines so multi-line console.log calls render one frame per line.
+  for (const line of String(raw).split(/\r?\n/)) {
+    if (!line) continue;
+    const entry = { stream, line, ts: Date.now() };
+    _selfLogBuffer.push(entry);
+    if (_selfLogBuffer.length > _SELF_LOG_CAP) {
+      _selfLogBuffer.splice(0, _selfLogBuffer.length - _SELF_LOG_CAP);
+    }
+    for (const { send } of _selfLogSubs) {
+      try { send(stream, line); } catch (_) { /* ignore */ }
+    }
+  }
+}
+
+(function _patchConsole() {
+  // Keep references to the real console methods so we still write to stdout
+  // (launchd captures it for the on-disk log files).
+  const origLog  = console.log.bind(console);
+  const origInfo = console.info.bind(console);
+  const origWarn = console.warn.bind(console);
+  const origErr  = console.error.bind(console);
+  const fmt = (args) => args.map(a => {
+    if (a instanceof Error) return a.stack || a.message;
+    if (typeof a === 'string') return a;
+    try { return JSON.stringify(a); } catch { return String(a); }
+  }).join(' ');
+  console.log   = (...args) => { _pushSelfLog('out', fmt(args)); origLog(...args); };
+  console.info  = (...args) => { _pushSelfLog('out', fmt(args)); origInfo(...args); };
+  console.warn  = (...args) => { _pushSelfLog('err', fmt(args)); origWarn(...args); };
+  console.error = (...args) => { _pushSelfLog('err', fmt(args)); origErr(...args); };
+})();
+
 // Parse the cloudflared tunnel name out of a full command line.
 // cloudflared accepts:
 //   `cloudflared tunnel run <NAME>`
@@ -484,6 +532,31 @@ export const commands = {
     const entry = ctx?._tunnelLogEntries?.get(name);
     if (subs && entry) subs.delete(entry);
     if (ctx?._tunnelLogEntries) ctx._tunnelLogEntries.delete(name);
+    return { ok: true, stopped: true };
+  },
+
+  // relay.logs.tail() — subscribe to the relay's own stdout/stderr, captured
+  // from console.log/warn/error since this module loaded. Replays the ring
+  // buffer first, then forwards every new line as `{type:'log', stream, line}`
+  // — same envelope as pm2.logs.tail and tunnel.logs.tail. Useful for
+  // debugging "the relay itself is doing something weird" from the dashboard
+  // without having to SSH and tail ~/Library/Logs/jg-local-relay/.
+  async 'relay.logs.tail'(_args = {}, ctx) {
+    const cmdId = ctx?.id;
+    const send = (stream, line) => {
+      try { ctx?.send?.({ type: 'log', id: cmdId, stream, line }); } catch (_) {}
+    };
+    for (const { stream, line } of _selfLogBuffer) send(stream, line);
+    const entry = { ctx, send };
+    _selfLogSubs.add(entry);
+    if (ctx) ctx._selfLogEntry = entry;
+    return { ok: true, streaming: true, buffered: _selfLogBuffer.length };
+  },
+
+  async 'relay.logs.stop'(_args = {}, ctx) {
+    const entry = ctx?._selfLogEntry;
+    if (entry) _selfLogSubs.delete(entry);
+    if (ctx) delete ctx._selfLogEntry;
     return { ok: true, stopped: true };
   },
 
