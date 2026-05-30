@@ -402,12 +402,19 @@ export const commands = {
     return { tunnels };
   },
 
-  async 'tunnel.start'({ name } = {}) {
+  async 'tunnel.start'({ name, url } = {}) {
     if (!name || typeof name !== 'string') throw new Error('tunnel.start requires `name`');
     const key = `tunnel:${name}`;
     if (_backgroundProcs.has(key)) return { ok: true, alreadyRunning: true, name };
     const bin = process.env.JG_CLOUDFLARED_BIN || 'cloudflared';
-    const child = spawn(bin, ['tunnel', 'run', name], { stdio: ['ignore', 'pipe', 'pipe'], detached: false });
+    // Pass --url so cloudflared forwards traffic to the local dev port
+    // without needing a per-tunnel ingress YAML on disk. Without --url,
+    // `cloudflared tunnel run <name>` connects to the edge with no
+    // ingress rules → CF returns 503 on every request to the hostname.
+    const args = ['tunnel', 'run'];
+    if (url && typeof url === 'string') args.push('--url', url);
+    args.push(name);
+    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: false });
     _backgroundProcs.set(key, child);
     child.on('error', (err) => {
       _backgroundProcs.delete(key);
@@ -417,7 +424,7 @@ export const commands = {
       _backgroundProcs.delete(key);
       console.log(`[tunnel] ${name} exited code=${code}`);
     });
-    return { ok: true, name, pid: child.pid };
+    return { ok: true, name, url: url || null, pid: child.pid };
   },
 
   async 'tunnel.stop'({ name } = {}) {
