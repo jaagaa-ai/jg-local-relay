@@ -6,7 +6,7 @@
 // (pm2 start/stop/restart, logs.tail, tunnel.start/stop, git.*, env.read/write).
 
 import { execFile, spawn } from 'node:child_process';
-import { existsSync, readFileSync, watch as fsWatch } from 'node:fs';
+import { existsSync, readFileSync, watch as fsWatch, mkdirSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
@@ -134,6 +134,94 @@ export const commands = {
   // the raw `pm2 jlist` JSON so the cp can feed it through its existing
   // mapPm2Process() without a parallel mapper. Resolve the pm2 binary via
   // JG_PM2_BIN, else PATH `pm2`.
+  // Clone (or update) a repo onto the user's local disk. Called by cp
+  // when an admin grants this user access to a new repository. Idempotent:
+  // if `dest` already has a .git dir we fetch + (optional) checkout
+  // instead of cloning, so re-granting an existing repo is harmless.
+  //
+  // Cross-platform: uses node:fs.mkdirSync ({ recursive: true }) for the
+  // parent dir, git CLI for clone/fetch. Works on Mac, Linux, Windows
+  // (git is the only external requirement; if cloudflared is installed
+  // for tunnels then git almost certainly is too).
+  async 'repo.clone'({ slug, url, dest, branch } = {}) {
+    if (!url || typeof url !== 'string')  throw new Error('repo.clone requires `url`');
+    if (!dest || typeof dest !== 'string') throw new Error('repo.clone requires `dest`');
+    if (existsSync(path.join(dest, '.git'))) {
+      try { await run('git', ['-C', dest, 'fetch', '--quiet'], { timeout: 60_000 }); } catch (_) {}
+      if (branch) {
+        try { await run('git', ['-C', dest, 'checkout', branch], { timeout: 10_000 }); } catch (_) {}
+      }
+      return { ok: true, slug: slug || null, dest, action: 'updated' };
+    }
+    const parent = path.dirname(dest);
+    try { mkdirSync(parent, { recursive: true }); } catch (_) {}
+    const args = ['clone', '--quiet'];
+    if (branch) args.push('--branch', branch);
+    args.push(url, dest);
+    await run('git', args, { timeout: 180_000 });
+    return { ok: true, slug: slug || null, dest, action: 'cloned' };
+  },
+
+  // Remove a local repo from disk. Called by cp when an admin revokes
+  // this user's access. Safety checks: refuse obviously-wrong paths
+  // (root, homedir, short paths), refuse dirs with uncommitted changes
+  // unless `force=true`, refuse dirs that are the cwd of a running pm2
+  // process unless `force=true`. fs.rmSync is cross-platform.
+  async 'repo.wipe'({ dest, force } = {}) {
+    if (!dest || typeof dest !== 'string') throw new Error('repo.wipe requires `dest`');
+    const abs = path.resolve(dest);
+    const unsafe = ['/', '/Users', '/home', '/root', os.homedir(), path.dirname(os.homedir())];
+    if (abs.length < 10 || unsafe.includes(abs)) {
+      throw new Error(`repo.wipe refused: ${abs} looks unsafe`);
+    }
+    if (!existsSync(abs)) return { ok: true, dest: abs, action: 'not_present' };
+
+    // Uncommitted-changes guard.
+    if (!force && existsSync(path.join(abs, '.git'))) {
+      try {
+        const { stdout } = await run('git', ['-C', abs, 'status', '--porcelain'], { timeout: 4_000 });
+        if (stdout.trim().length > 0) {
+          return {
+            ok: false, dest: abs, action: 'has_uncommitted',
+            error: 'Uncommitted changes present — re-run with force=true to override.',
+          };
+        }
+      } catch (_) { /* not git or git missing — fall through */ }
+    }
+
+    // Running-process guard. If a pm2 process is currently online with
+    // this dir as its cwd, refuse unless forced.
+    if (!force) {
+      try {
+        const bin = process.env.JG_PM2_BIN || 'pm2';
+        const { stdout } = await run(bin, ['jlist'], { timeout: 4_000 });
+        const procs = JSON.parse(stdout || '[]');
+        const running = procs.find((p) =>
+          p?.pm2_env?.pm_cwd === abs && p?.pm2_env?.status === 'online');
+        if (running) {
+          return {
+            ok: false, dest: abs, action: 'process_running',
+            error: `${running.name} is running from this dir — stop it first or re-run with force=true.`,
+          };
+        }
+      } catch (_) { /* tolerate missing pm2 */ }
+    }
+
+    // Also stop any active git.status watcher for this cwd before wipe.
+    const w = _gitWatchers.get(abs);
+    if (w) {
+      for (const wt of w.watchers) { try { wt.close(); } catch (_) {} }
+      _gitWatchers.delete(abs);
+    }
+
+    try {
+      rmSync(abs, { recursive: true, force: true });
+    } catch (e) {
+      throw new Error(`repo.wipe failed: ${e.message}`);
+    }
+    return { ok: true, dest: abs, action: 'wiped' };
+  },
+
   async 'pm2.list'() {
     const bin = process.env.JG_PM2_BIN || 'pm2';
     const { stdout } = await run(bin, ['jlist']);
