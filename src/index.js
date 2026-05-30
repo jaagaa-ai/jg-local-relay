@@ -18,6 +18,17 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { commands } from './commands.js';
 
+// Last-resort guards — even one un-caught spawn error has killed the relay
+// hard enough that launchd takes ~8s to bring us back. During that window cp
+// thinks the user is offline and every action 503s. Keep us alive and log
+// loudly instead.
+process.on('uncaughtException', (err) => {
+  try { console.error('[relay] uncaughtException:', err?.stack || err); } catch (_) {}
+});
+process.on('unhandledRejection', (reason) => {
+  try { console.error('[relay] unhandledRejection:', reason); } catch (_) {}
+});
+
 const CP_URL = process.env.JG_CP_URL || 'ws://localhost:7090/relay';
 const TOKEN = process.env.JG_RELAY_TOKEN || '';
 const RELAY_ID = process.env.JG_RELAY_ID || os.hostname();

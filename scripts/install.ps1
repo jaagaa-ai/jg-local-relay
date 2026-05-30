@@ -48,9 +48,16 @@ Invoke-WebRequest -Uri $SrcUrl -OutFile $Tarball -UseBasicParsing
 tar -xzf $Tarball -C $Prefix
 
 Write-Host "-> Installing Node dependencies"
+# pm2 is a hard dep of jg-local-relay (see its package.json), so this single
+# install also brings pm2 into $Prefix\node_modules — no separate global
+# install step. JG_PM2_BIN below pins the relay to this local copy.
 Push-Location $Prefix
 & npm install --omit=dev --no-fund --no-audit --silent
 Pop-Location
+
+# Local pm2 binary owned by this relay install. npm on Windows writes a
+# pm2.cmd shim in node_modules\.bin; either path works for child_process.spawn.
+$Pm2Bin = Join-Path $Prefix "node_modules\.bin\pm2.cmd"
 
 # Wrap the relay launch in a small VBS so it runs hidden (no console window
 # at logon). The vbs invokes node with our env baked in.
@@ -65,6 +72,7 @@ sh.Environment("Process").Item("JG_CP_URL")         = "$CpUrl"
 sh.Environment("Process").Item("JG_RELAY_TOKEN")    = "$Token"
 sh.Environment("Process").Item("JG_RELAY_ID")       = "$RelayId"
 sh.Environment("Process").Item("JG_RELAY_PROJECTS") = "$Projects"
+sh.Environment("Process").Item("JG_PM2_BIN")        = "$Pm2Bin"
 sh.Run "cmd /c """"$NodeBin"" ""$IndexJs"" >> ""$OutLog"" 2>> ""$ErrLog""", 0, False
 "@
 Set-Content -Path $VbsPath -Value $VbsContent -Encoding ASCII

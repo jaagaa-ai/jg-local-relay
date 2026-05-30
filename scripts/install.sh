@@ -77,7 +77,16 @@ fi
 tar -xzf "$TMP/bundle.tar.gz" -C "$PREFIX"
 
 echo "→ Installing Node dependencies"
+# pm2 ships as a hard dependency in the relay's package.json, so this single
+# `npm install` brings it in alongside ws — no separate `npm i -g pm2` step
+# and no PATH dance. Resolved binary path goes into JG_PM2_BIN below.
 ( cd "$PREFIX" && npm install --omit=dev --no-fund --no-audit --silent )
+
+# Local pm2 binary — owned by this relay install, isolated from any global
+# pm2 the user may (or may not) have. The relay reads JG_PM2_BIN at spawn
+# time; without it, a missing global pm2 would fire spawn-ENOENT and kill
+# the relay process before launchd could restart it.
+PM2_BIN="${PREFIX}/node_modules/.bin/pm2"
 
 if [ "$PLATFORM" = "mac" ]; then
   PLIST="${HOME}/Library/LaunchAgents/ai.jaagaa.localrelay.plist"
@@ -100,6 +109,7 @@ if [ "$PLATFORM" = "mac" ]; then
     <key>JG_RELAY_TOKEN</key><string>${TOKEN}</string>
     <key>JG_RELAY_ID</key><string>${RELAY_ID}</string>
     <key>JG_RELAY_PROJECTS</key><string>${PROJECTS}</string>
+    <key>JG_PM2_BIN</key><string>${PM2_BIN}</string>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -133,6 +143,7 @@ Environment=JG_CP_URL=${CP_URL}
 Environment=JG_RELAY_TOKEN=${TOKEN}
 Environment=JG_RELAY_ID=${RELAY_ID}
 Environment=JG_RELAY_PROJECTS=${PROJECTS}
+Environment=JG_PM2_BIN=${PM2_BIN}
 StandardOutput=append:${LOG_DIR}/out.log
 StandardError=append:${LOG_DIR}/err.log
 

@@ -149,6 +149,14 @@ export const commands = {
     if (prev) { try { prev.kill('SIGTERM'); } catch (_) {} }
     const child = spawn(bin, ['logs', name, '--raw', '--lines', '0'], { stdio: ['ignore', 'pipe', 'pipe'] });
     _backgroundProcs.set(key, child);
+    // Without this, a missing pm2 binary fires 'error' on the child and —
+    // because spawn has no default error handler — crashes the whole relay
+    // process. launchd would restart us a few seconds later but every
+    // command in flight would already be lost.
+    child.on('error', (err) => {
+      _backgroundProcs.delete(key);
+      try { ctx?.send?.({ type: 'log', id: ctx?.id, stream: 'err', line: `[relay] pm2 spawn failed: ${err.message}` }); } catch (_) {}
+    });
     // Include the command id in every log frame so cp can correlate
     // multiple concurrent log tails to the right WSS client.
     const cmdId = ctx?.id;
@@ -207,6 +215,10 @@ export const commands = {
     const bin = process.env.JG_CLOUDFLARED_BIN || 'cloudflared';
     const child = spawn(bin, ['tunnel', 'run', name], { stdio: ['ignore', 'pipe', 'pipe'], detached: false });
     _backgroundProcs.set(key, child);
+    child.on('error', (err) => {
+      _backgroundProcs.delete(key);
+      console.warn(`[tunnel] ${name} spawn failed: ${err.message}`);
+    });
     child.on('exit', (code) => {
       _backgroundProcs.delete(key);
       console.log(`[tunnel] ${name} exited code=${code}`);
