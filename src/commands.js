@@ -594,6 +594,20 @@ export const commands = {
     const send = (stream, line) => {
       try { ctx?.send?.({ type: 'log', id: cmdId, stream, line }); } catch (_) {}
     };
+    // We can only capture stdout/stderr from cloudflared children WE spawned
+    // (via tunnel.start). If the process was already running when this relay
+    // started — adopted via ps detection — there's no pipe to read from, so
+    // the buffer will stay empty forever. Detect this case and surface it so
+    // the dashboard doesn't show "waiting for log lines…" indefinitely.
+    const weOwnIt = _backgroundProcs.has(`tunnel:${name}`);
+    if (!weOwnIt && !_tunnelLogBuffers.has(name)) {
+      const notice = [
+        `[relay] tunnel "${name}" is running but was not spawned by this relay session,`,
+        `so cloudflared's stdout/stderr can't be captured. To enable live log streaming,`,
+        `click Restart on the tunnel from the dashboard — that will re-spawn it under this relay.`,
+      ].join(' ');
+      _tunnelLogBuffers.set(name, [{ stream: 'err', line: notice }]);
+    }
     // Replay buffered history
     const buf = _tunnelLogBuffers.get(name);
     if (buf) for (const { stream, line } of buf) send(stream, line);
@@ -604,7 +618,7 @@ export const commands = {
     // Stash a per-ctx unsubscribe so tunnel.logs.stop can find it.
     if (!ctx._tunnelLogEntries) ctx._tunnelLogEntries = new Map();
     ctx._tunnelLogEntries.set(name, entry);
-    return { ok: true, name, streaming: true };
+    return { ok: true, name, streaming: true, owned: weOwnIt };
   },
 
   async 'tunnel.logs.stop'({ name } = {}, ctx) {
