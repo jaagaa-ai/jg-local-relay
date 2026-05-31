@@ -16,7 +16,7 @@ import os from 'node:os';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { commands } from './commands.js';
+import { commands, adoptOrphanTunnels } from './commands.js';
 
 // Last-resort guards — even one un-caught spawn error has killed the relay
 // hard enough that launchd takes ~8s to bring us back. During that window cp
@@ -153,5 +153,18 @@ process.on('SIGTERM', () => {
   try { ws?.close(); } catch {}
   process.exit(0);
 });
+
+// Sole-ownership doctrine: at startup, kill any cloudflared processes the
+// relay didn't spawn itself and re-spawn them under tunnel.start so we own
+// their stdout/stderr pipes (required for tunnel.logs.tail). Runs in parallel
+// with connect() — we don't block on it. ~2s downtime per orphan during the
+// SIGTERM→respawn window is the accepted trade-off.
+adoptOrphanTunnels()
+  .then((r) => {
+    if (r.adopted > 0) {
+      log(`[tunnel] adopted ${r.adopted} orphan tunnel(s): ${r.results.map((x) => x.name).join(', ')}`);
+    }
+  })
+  .catch((e) => log(`[tunnel] adoptOrphanTunnels error: ${e.message}`));
 
 connect();

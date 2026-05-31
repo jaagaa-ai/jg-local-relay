@@ -273,6 +273,62 @@ function _parseCloudflaredTunnelName(cmd) {
   return last;
 }
 
+// Pull the `--url <local>` argument out of a cloudflared command line, if any.
+// Used by the orphan-adoption flow so we can re-spawn an existing tunnel with
+// the same forward target it had before.
+function _parseCloudflaredTunnelUrl(cmd) {
+  const m = cmd.match(/--url[=\s]+(\S+)/);
+  return m ? m[1] : null;
+}
+
+// Detect cloudflared processes the relay didn't spawn itself, then kill +
+// re-spawn each one under our control so we own its stdout/stderr pipes
+// (without that, tunnel.logs.tail can never produce log lines for them).
+// Sole-ownership doctrine: the relay is the sole spawner of cloudflared on
+// this machine. Anything else gets adopted.
+//
+// Safe to call multiple times — already-owned tunnels are skipped via the
+// _backgroundProcs map. Brief (~2s) downtime per orphan during the SIGTERM →
+// respawn window is an accepted trade-off.
+export async function adoptOrphanTunnels() {
+  const ps = await run('ps', ['-axo', 'pid=,command=']).catch(() => ({ stdout: '' }));
+  const lines = (ps.stdout || '').split(/\r?\n/).filter(Boolean);
+  const orphans = [];
+  for (const rawLine of lines) {
+    const m0 = rawLine.match(/^\s*(\d+)\s+(.*)$/);
+    if (!m0) continue;
+    const pid = parseInt(m0[1], 10);
+    const cmd = m0[2];
+    if (!/(^|\/)cloudflared(\s|$)/.test(cmd)) continue;
+    const name = _parseCloudflaredTunnelName(cmd);
+    if (!name) continue;
+    if (_backgroundProcs.has(`tunnel:${name}`)) continue; // already ours
+    orphans.push({ pid, name, url: _parseCloudflaredTunnelUrl(cmd) });
+  }
+  if (!orphans.length) return { adopted: 0, results: [] };
+  const results = [];
+  for (const o of orphans) {
+    try {
+      console.log(`[tunnel] adopting orphan "${o.name}" (pid=${o.pid}, url=${o.url || 'unknown'})`);
+      try { process.kill(o.pid, 'SIGTERM'); } catch (e) {
+        // EPERM (not our process) or ESRCH (already gone) — skip; tunnel.start
+        // will fail loudly below if the port is still bound.
+        console.warn(`[tunnel] kill ${o.pid} failed: ${e.message}`);
+      }
+      // Wait for the orphan to release the connection. cloudflared usually
+      // exits within ~500ms on SIGTERM; give it 1.5s margin.
+      await new Promise((r) => setTimeout(r, 1500));
+      const r2 = await commands['tunnel.start']({ name: o.name, url: o.url });
+      results.push({ name: o.name, oldPid: o.pid, newPid: r2.pid, ok: true });
+      console.log(`[tunnel] re-spawned "${o.name}" under relay control (pid=${r2.pid})`);
+    } catch (e) {
+      results.push({ name: o.name, oldPid: o.pid, ok: false, error: e.message });
+      console.warn(`[tunnel] adopt failed for "${o.name}": ${e.message}`);
+    }
+  }
+  return { adopted: results.filter((r) => r.ok).length, results };
+}
+
 function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
     execFile(cmd, args, { timeout: 15000, maxBuffer: 8 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
@@ -716,6 +772,14 @@ export const commands = {
     child.stdout.on('data', fanout('out'));
     child.stderr.on('data', fanout('err'));
     return { ok: true, name, url: url || null, pid: child.pid };
+  },
+
+  // Adopt any cloudflared processes the relay didn't spawn itself: SIGTERM
+  // the orphan, wait for it to release, then re-spawn it under tunnel.start
+  // so we own stdout/stderr. Called automatically at relay boot; cp can also
+  // trigger it remotely (e.g. when user clicks 'Adopt all' in the UI).
+  async 'tunnel.adoptAll'() {
+    return adoptOrphanTunnels();
   },
 
   async 'tunnel.stop'({ name } = {}) {
