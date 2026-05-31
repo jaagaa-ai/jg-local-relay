@@ -225,34 +225,43 @@ function _selfMgmtScript(op) {
   throw new Error(`unsupported platform: ${platform}`);
 }
 
-// Build the platform-specific "npm install + restart" script that powers
-// relay.self_update. Mirrors _selfMgmtScript('restart') for the restart half;
-// prepends a global npm install of @jaagaa-ai/jg-local-relay@<version>.
-// The whole thing runs detached in the background so the relay can reply OK
-// to cp before its process is replaced.
-function _selfUpdateScript(version) {
-  const pkg = `@jaagaa-ai/jg-local-relay@${version || 'latest'}`;
+// Build the platform-specific self-update script. We don't pull from npm —
+// the relay isn't published there. Instead we re-run cp's install script
+// (install-relay.sh on Mac/Linux, install-relay.ps1 on Windows), which
+// downloads the freshest bundle from cp.jaagaa.ai/relay-bundle.tar.gz,
+// extracts over the existing install dir, npm-installs deps, rewrites the
+// LaunchAgent / systemd unit, and reloads — exactly what manual re-install
+// does, just without the user copy-pasting.
+//
+// Env vars (JG_RELAY_TOKEN, JG_CP_URL, JG_RELAY_PROJECTS, JG_RELAY_ID) are
+// already in our process env (set by the LaunchAgent plist), so the install
+// script picks them up non-interactively. Detached so this relay process
+// can reply OK and exit cleanly when launchctl bootout fires inside the
+// installer.
+function _selfUpdateScript(_version) {
+  // Derive https endpoint from JG_CP_URL (wss://cp.jaagaa.ai/relay →
+  // https://cp.jaagaa.ai). Fallback to prod cp if unset.
+  const cpWs   = process.env.JG_CP_URL || 'wss://cp.jaagaa.ai/relay';
+  const cpHttp = cpWs.replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:').replace(/\/relay\/?$/, '');
   const platform = process.platform;
-  if (platform === 'darwin') {
-    const uid = (typeof process.getuid === 'function' && process.getuid()) || process.env.UID || 501;
-    const LABEL = 'ai.jaagaa.localrelay';
+  if (platform === 'darwin' || platform === 'linux') {
+    const url = `${cpHttp}/install-relay.sh`;
+    // sh -c: 2s preamble so we can return OK before our process is replaced.
+    // -fsSL: fail on HTTP error, silent, follow redirects.
+    // -H Authorization: cp gates /install-relay.sh on the per-user token.
+    // | sh: pipe straight into install. JG_RELAY_TOKEN/JG_CP_URL/PROJECTS
+    // env-vars are already in our process env and inherit to the sh child,
+    // so install runs non-interactively.
     return {
       interpreter: '/bin/sh',
-      args: ['-c', `(sleep 2; npm install -g ${pkg} && launchctl kickstart -k gui/${uid}/${LABEL}) &`],
-    };
-  }
-  if (platform === 'linux') {
-    const UNIT = 'jg-local-relay.service';
-    return {
-      interpreter: '/bin/sh',
-      args: ['-c', `(sleep 2; npm install -g ${pkg} && systemctl --user restart ${UNIT}) &`],
+      args: ['-c', `(sleep 2; curl -fsSL "${url}" -H "Authorization: Bearer $JG_RELAY_TOKEN" | sh) >/dev/null 2>&1 &`],
     };
   }
   if (platform === 'win32') {
-    const TASK = 'JgLocalRelay';
+    const url = `${cpHttp}/install-relay.ps1`;
     return {
       interpreter: 'powershell.exe',
-      args: ['-NoProfile', '-Command', `Start-Sleep -Seconds 2; npm install -g ${pkg}; if ($LASTEXITCODE -eq 0) { schtasks /End /TN "${TASK}"; Start-Sleep -Seconds 1; schtasks /Run /TN "${TASK}" }`],
+      args: ['-NoProfile', '-Command', `Start-Sleep -Seconds 2; iwr "${url}" -Headers @{Authorization="Bearer $env:JG_RELAY_TOKEN"} -UseBasicParsing | iex`],
     };
   }
   throw new Error(`unsupported platform: ${platform}`);
