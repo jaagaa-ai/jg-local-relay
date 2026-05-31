@@ -225,6 +225,39 @@ function _selfMgmtScript(op) {
   throw new Error(`unsupported platform: ${platform}`);
 }
 
+// Build the platform-specific "npm install + restart" script that powers
+// relay.self_update. Mirrors _selfMgmtScript('restart') for the restart half;
+// prepends a global npm install of @jaagaa-ai/jg-local-relay@<version>.
+// The whole thing runs detached in the background so the relay can reply OK
+// to cp before its process is replaced.
+function _selfUpdateScript(version) {
+  const pkg = `@jaagaa-ai/jg-local-relay@${version || 'latest'}`;
+  const platform = process.platform;
+  if (platform === 'darwin') {
+    const uid = (typeof process.getuid === 'function' && process.getuid()) || process.env.UID || 501;
+    const LABEL = 'ai.jaagaa.localrelay';
+    return {
+      interpreter: '/bin/sh',
+      args: ['-c', `(sleep 2; npm install -g ${pkg} && launchctl kickstart -k gui/${uid}/${LABEL}) &`],
+    };
+  }
+  if (platform === 'linux') {
+    const UNIT = 'jg-local-relay.service';
+    return {
+      interpreter: '/bin/sh',
+      args: ['-c', `(sleep 2; npm install -g ${pkg} && systemctl --user restart ${UNIT}) &`],
+    };
+  }
+  if (platform === 'win32') {
+    const TASK = 'JgLocalRelay';
+    return {
+      interpreter: 'powershell.exe',
+      args: ['-NoProfile', '-Command', `Start-Sleep -Seconds 2; npm install -g ${pkg}; if ($LASTEXITCODE -eq 0) { schtasks /End /TN "${TASK}"; Start-Sleep -Seconds 1; schtasks /Run /TN "${TASK}" }`],
+    };
+  }
+  throw new Error(`unsupported platform: ${platform}`);
+}
+
 function _spawnSelfMgmtScript(op, script) {
   // Fully detach so the helper outlives this relay process. unref() lets
   // the relay exit naturally if the script's parent group is gone, and
@@ -732,6 +765,23 @@ export const commands = {
   },
   async 'relay.uninstall'() {
     return _spawnSelfMgmtScript('uninstall', _selfMgmtScript('uninstall'));
+  },
+
+  // Self-update: npm install -g the requested version, then trigger a
+  // platform-native restart (launchctl kickstart on Mac, systemctl --user
+  // restart on Linux, scheduled-task end+run on Windows). Runs detached so
+  // we can reply OK before our own process is replaced.
+  //
+  // cp calls this automatically when the version reported in `hello` is
+  // older than the target version cp shipped with — see the welcome path
+  // in jg-control-plane/manager/server.js. Idempotent: calling with the
+  // current version is harmless (npm no-ops, restart kicks).
+  async 'relay.self_update'({ version } = {}) {
+    if (!version || typeof version !== 'string') {
+      throw new Error('relay.self_update requires a `version` string');
+    }
+    console.log(`[relay] self_update → ${version} (current ${VERSION})`);
+    return _spawnSelfMgmtScript('self_update', _selfUpdateScript(version));
   },
 
   async 'tunnel.start'({ name, url } = {}) {
