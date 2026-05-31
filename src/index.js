@@ -53,6 +53,11 @@ function log(...a) {
   console.log(new Date().toISOString(), '[relay]', ...a);
 }
 
+// Boot marker — first thing the relay says on startup. Useful when verifying
+// that auto-update actually replaced the running process (the new boot line
+// shows up in the live-logs pane right after launchctl bootstrap).
+log(`booting v${VERSION} on ${process.platform} (pid ${process.pid})`);
+
 function send(obj) {
   try {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
