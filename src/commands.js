@@ -805,7 +805,21 @@ export const commands = {
     const args = ['tunnel', 'run'];
     if (url && typeof url === 'string') args.push('--url', url);
     args.push(name);
-    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: false });
+    // detached:true puts cloudflared in its OWN process group so it survives
+    // relay events that would otherwise SIGTERM the whole group — crash,
+    // launchctl bootout (manual restart), self_update (auto-update). Without
+    // this the user saw all tunnels go offline every time the relay updated
+    // itself, even though pm2 services stayed up (pm2 has its own daemon).
+    // unref() releases the event-loop ref so the relay can exit even while
+    // cloudflared is running. stdio:['ignore','pipe','pipe'] preserves the
+    // stdout/stderr pipes we need for tunnel.logs.tail.
+    //
+    // After relay restart, adoptOrphanTunnels() (see boot path in index.js)
+    // detects the surviving cloudflared via `ps`, kills+respawns it under
+    // the NEW relay so we own the pipes again. Brief ~2s downtime per tunnel
+    // during that handoff is the trade-off vs total-outage.
+    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    child.unref();
     _backgroundProcs.set(key, child);
     child.on('error', (err) => {
       _backgroundProcs.delete(key);
