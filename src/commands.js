@@ -560,17 +560,20 @@ export const commands = {
   // Single concurrent stream per process name — re-issuing kills the
   // prior tail. Returns immediately; ctx.send keeps emitting until
   // pm2.logs.stop or relay disconnect.
-  async 'pm2.logs.tail'({ name } = {}, ctx) {
+  async 'pm2.logs.tail'({ name, lines } = {}, ctx) {
     if (!name || typeof name !== 'string') throw new Error('pm2.logs.tail requires `name`');
     const bin = process.env.JG_PM2_BIN || 'pm2';
     const key = `logs:${name}`;
     const prev = _backgroundProcs.get(key);
     if (prev) { try { prev.kill('SIGTERM'); } catch (_) {} }
-    // --lines 100 flushes the last 100 historical lines BEFORE following new
-    // ones. With --lines 0 (the prior default) pm2 only emitted brand-new
-    // lines, so the user saw "waiting for log lines…" whenever the proc
-    // was idle — even when the log file was full of useful past output.
-    const child = spawn(bin, ['logs', name, '--raw', '--lines', '100'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // `lines` controls how many historical bytes pm2 replays before following
+    // new ones. Default 100 for running services (gives context). Cp passes
+    // 0 when the service is stopped — there's nothing useful in the previous
+    // run's tail to surface alongside the "[manager] not running" notice,
+    // and the historical content was confusing users into thinking the proc
+    // was alive ("why am I seeing GET / 200 if it's stopped?").
+    const linesArg = Number.isFinite(lines) && lines >= 0 ? String(lines) : '100';
+    const child = spawn(bin, ['logs', name, '--raw', '--lines', linesArg], { stdio: ['ignore', 'pipe', 'pipe'] });
     _backgroundProcs.set(key, child);
     // Without this, a missing pm2 binary fires 'error' on the child and —
     // because spawn has no default error handler — crashes the whole relay
