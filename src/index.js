@@ -16,7 +16,7 @@ import os from 'node:os';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { commands, adoptOrphanTunnels } from './commands.js';
+import { commands, adoptOrphanTunnels, restoreOwnedTunnels } from './commands.js';
 
 // Last-resort guards — even one un-caught spawn error has killed the relay
 // hard enough that launchd takes ~8s to bring us back. During that window cp
@@ -159,17 +159,34 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-// Sole-ownership doctrine: at startup, kill any cloudflared processes the
-// relay didn't spawn itself and re-spawn them under tunnel.start so we own
-// their stdout/stderr pipes (required for tunnel.logs.tail). Runs in parallel
-// with connect() — we don't block on it. ~2s downtime per orphan during the
-// SIGTERM→respawn window is the accepted trade-off.
-adoptOrphanTunnels()
+// Sole-ownership re-establishment. Two passes in order, both non-blocking:
+//
+// 1) restoreOwnedTunnels — reads the persisted state file
+//    (~/Library/Application Support/jg-local-relay/.state.json on Mac) and
+//    for every tunnel WE previously owned, kills any matching cloudflared
+//    in ps + fresh spawns under our control. This is the authoritative path
+//    after a relay update / crash / reboot: tunnels marked "ours" come back
+//    automatically without needing to be guessed at via ps detection.
+//
+// 2) adoptOrphanTunnels — best-effort safety net for cloudflared started
+//    OUTSIDE the relay (e.g. by the legacy :5400 manager, or by hand). Same
+//    kill + respawn idea, just keyed on ps rather than the state file.
+//    Skipped tunnels already restored in (1).
+//
+// ~2s downtime per tunnel during the kill→respawn window is the accepted
+// trade-off vs leaving stale processes around or losing log pipes.
+restoreOwnedTunnels()
   .then((r) => {
-    if (r.adopted > 0) {
-      log(`[tunnel] adopted ${r.adopted} orphan tunnel(s): ${r.results.map((x) => x.name).join(', ')}`);
+    if (r.restored > 0) {
+      log(`[tunnel] restored ${r.restored} tunnel(s) from state: ${r.results.filter((x) => x.ok).map((x) => x.name).join(', ')}`);
+    }
+    return adoptOrphanTunnels();
+  })
+  .then((r) => {
+    if (r && r.adopted > 0) {
+      log(`[tunnel] adopted ${r.adopted} additional orphan(s): ${r.results.map((x) => x.name).join(', ')}`);
     }
   })
-  .catch((e) => log(`[tunnel] adoptOrphanTunnels error: ${e.message}`));
+  .catch((e) => log(`[tunnel] boot restore error: ${e.message}`));
 
 connect();

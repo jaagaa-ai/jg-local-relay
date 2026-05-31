@@ -315,6 +315,96 @@ function _parseCloudflaredTunnelName(cmd) {
   return last;
 }
 
+// Persistent state file — what the relay owns. Right now it tracks tunnels
+// only (the things the relay spawns directly). PM2 services are managed by
+// a separate pm2 daemon that survives relay restarts independently, so they
+// don't need to be in here. On every tunnel.start/stop we rewrite this file
+// synchronously; on boot we read it and replay (kill any stray cloudflared
+// matching the saved name, fresh spawn under our control). No dependency on
+// ps-based orphan detection or detached-child survival.
+import { readFileSync as _readState, writeFileSync as _writeState, existsSync as _hasState, mkdirSync as _mkdirState } from 'node:fs';
+function _stateFilePath() {
+  const platform = process.platform;
+  if (platform === 'darwin') return `${os.homedir()}/Library/Application Support/jg-local-relay/.state.json`;
+  if (platform === 'linux')  return `${process.env.XDG_STATE_HOME || `${os.homedir()}/.local/state`}/jg-local-relay/.state.json`;
+  if (platform === 'win32')  return `${process.env.LOCALAPPDATA}\\jg-local-relay\\.state.json`;
+  throw new Error(`unsupported platform: ${platform}`);
+}
+function _loadOwnedState() {
+  try {
+    const p = _stateFilePath();
+    if (!_hasState(p)) return { tunnels: {} };
+    const parsed = JSON.parse(_readState(p, 'utf8'));
+    return { tunnels: (parsed && parsed.tunnels) || {} };
+  } catch (e) {
+    console.warn(`[state] load failed: ${e.message} — starting empty`);
+    return { tunnels: {} };
+  }
+}
+function _saveOwnedState(state) {
+  try {
+    const p = _stateFilePath();
+    _mkdirState(path.dirname(p), { recursive: true });
+    _writeState(p, JSON.stringify(state, null, 2), { mode: 0o600 });
+  } catch (e) {
+    console.warn(`[state] save failed: ${e.message}`);
+  }
+}
+// In-memory mirror of the on-disk state — keyed by tunnel name.
+const _ownedTunnels = _loadOwnedState().tunnels;
+function _recordTunnel(name, url) {
+  _ownedTunnels[name] = { url: url || null, startedAt: Date.now() };
+  _saveOwnedState({ tunnels: _ownedTunnels });
+}
+function _forgetTunnel(name) {
+  delete _ownedTunnels[name];
+  _saveOwnedState({ tunnels: _ownedTunnels });
+}
+// Replay the persisted state on relay boot — for each saved tunnel, kill any
+// matching cloudflared in ps (regardless of who started it), then fresh
+// spawn via tunnel.start. Result: every tunnel that WAS running before the
+// last relay shutdown is running again under our control, with pipes we own
+// for log streaming. Brief (~2s) downtime per tunnel during the kill+spawn.
+export async function restoreOwnedTunnels() {
+  const names = Object.keys(_ownedTunnels);
+  if (!names.length) return { restored: 0, results: [] };
+  // Snapshot ps once so we don't fork it per tunnel.
+  const ps = await run('ps', ['-axo', 'pid=,command=']).catch(() => ({ stdout: '' }));
+  const lines = (ps.stdout || '').split(/\r?\n/).filter(Boolean);
+  const psPidsByName = new Map();
+  for (const rawLine of lines) {
+    const m0 = rawLine.match(/^\s*(\d+)\s+(.*)$/);
+    if (!m0) continue;
+    const cmd = m0[2];
+    if (!/(^|\/)cloudflared(\s|$)/.test(cmd)) continue;
+    const n = _parseCloudflaredTunnelName(cmd);
+    if (n) {
+      if (!psPidsByName.has(n)) psPidsByName.set(n, []);
+      psPidsByName.get(n).push(parseInt(m0[1], 10));
+    }
+  }
+  const results = [];
+  for (const name of names) {
+    const { url } = _ownedTunnels[name];
+    const pids = psPidsByName.get(name) || [];
+    for (const pid of pids) {
+      try { process.kill(pid, 'SIGTERM'); } catch (_) { /* gone already */ }
+    }
+    if (pids.length) await new Promise((r) => setTimeout(r, 1500));
+    try {
+      // Clear any in-memory bookkeeping from the dead process before respawn.
+      _backgroundProcs.delete(`tunnel:${name}`);
+      const r2 = await commands['tunnel.start']({ name, url });
+      results.push({ name, oldPids: pids, newPid: r2.pid, ok: true });
+      console.log(`[tunnel] restored "${name}" from state (url=${url || 'none'}, pid=${r2.pid})`);
+    } catch (e) {
+      results.push({ name, oldPids: pids, ok: false, error: e.message });
+      console.warn(`[tunnel] restore failed for "${name}": ${e.message}`);
+    }
+  }
+  return { restored: results.filter((r) => r.ok).length, results };
+}
+
 // Pull the `--url <local>` argument out of a cloudflared command line, if any.
 // Used by the orphan-adoption flow so we can re-spawn an existing tunnel with
 // the same forward target it had before.
@@ -847,6 +937,9 @@ export const commands = {
     };
     child.stdout.on('data', fanout('out'));
     child.stderr.on('data', fanout('err'));
+    // Persist ownership so a later relay restart can fully re-establish
+    // this tunnel (see restoreOwnedTunnels in index.js boot path).
+    _recordTunnel(name, url);
     return { ok: true, name, url: url || null, pid: child.pid };
   },
 
@@ -864,10 +957,13 @@ export const commands = {
     if (child) {
       try { child.kill('SIGTERM'); } catch (_) {}
       _backgroundProcs.delete(`tunnel:${name}`);
+      // Intentional stop — forget so the next relay boot doesn't auto-restart.
+      _forgetTunnel(name);
       return { ok: true, stopped: true, name };
     }
     // Not started by us — try pkill by name.
     await run('pkill', ['-f', `cloudflared.*${name}`]).catch(() => {});
+    _forgetTunnel(name);
     return { ok: true, stopped: true, name, viaPkill: true };
   },
 };
