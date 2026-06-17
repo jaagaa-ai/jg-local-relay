@@ -23,10 +23,56 @@ const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
   });
 });
 
+// Which coding CLI drives a chat turn + its argv. Mirrors jg-sandbox-runner's
+// buildAgentRun, but LOCAL: the CLI runs under the user's OWN $HOME, so it uses
+// their real `claude` subscription / config — no XDG sandbox overrides.
+function buildAgentRun({ cli, prompt, convId, convName, resume, started, model }) {
+  switch (cli) {
+    case 'codex':  return { bin: 'codex', argv: ['exec', prompt] };
+    case 'gemini': return { bin: 'gemini', argv: ['-p', prompt] };
+    case 'opencode': {
+      const a = ['run', '--dangerously-skip-permissions'];
+      if (model) a.push('--model', model);
+      if (started) a.push('--continue');
+      a.push(prompt);
+      return { bin: 'opencode', argv: a };
+    }
+    case 'claude':
+    default: {
+      const a = ['-p', '--dangerously-skip-permissions'];
+      if (convId) { if (resume) a.push('--resume', convId); else { a.push('--session-id', convId); if (convName) a.push('--name', convName); } }
+      else if (started) a.push('--continue');
+      a.push(prompt);
+      return { bin: 'claude', argv: a };
+    }
+  }
+}
+
+// cloudflared quick tunnel to a local port → public https URL (preview). Same
+// approach as jg-sandbox-runner/src/lib/tunnel.js.
+const QUICK_URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
+function startTunnel(port, onLog = () => {}) {
+  return new Promise((resolve, reject) => {
+    const cf = spawn('cloudflared', ['tunnel', '--no-autoupdate', '--url', `http://localhost:${port}`], { env: process.env });
+    let settled = false;
+    const timer = setTimeout(() => { if (!settled) { settled = true; try { cf.kill('SIGKILL'); } catch { /* gone */ } reject(new Error('tunnel timeout')); } }, 30_000);
+    const scan = (chunk) => {
+      const text = chunk.toString();
+      for (const line of text.split('\n')) if (line.trim()) onLog(line.trim());
+      const m = text.match(QUICK_URL_RE);
+      if (m && !settled) { settled = true; clearTimeout(timer); resolve({ url: m[0], proc: cf }); }
+    };
+    cf.stdout.on('data', scan); cf.stderr.on('data', scan);
+    cf.on('exit', (code) => { if (!settled) { settled = true; clearTimeout(timer); reject(new Error(`cloudflared exited ${code}`)); } });
+  });
+}
+
 export function makeEditorCommands({ ws }) {
   let workspace = null;            // absolute path of the active project dir
   const terms = new Map();         // termId -> Terminal
   const procs = new Map();         // name -> { child, logs:[] }
+  const previews = new Map();      // app -> { proc, tunnel, url, port }
+  const chatStarted = new Set();   // conv/app keys with an ongoing thread (for --continue)
   const pickTerm = (id) => (id && terms.get(id)) || (terms.size === 1 ? [...terms.values()][0] : null);
 
   // Resolve a path under the workspace; refuse traversal outside it.
@@ -140,13 +186,72 @@ export function makeEditorCommands({ ws }) {
       return { ok: true, output: (stdout + stderr).trim().slice(0, 1000) };
     },
 
-    // --- not wired yet (M3/M4) — explicit so the surface is discoverable ---
-    'preview.start': async () => { throw new Error('preview not wired in local mode yet (M3 — reuse relay tunnel.*)'); },
-    'preview.stop': async () => { throw new Error('preview not wired in local mode yet (M3)'); },
-    'preview.status': async () => ({ running: false, note: 'local preview wiring is M3' }),
-    'site.build': async () => { throw new Error('site.build not wired in local mode yet (M4 — local wrangler)'); },
-    'site.deploy': async () => { throw new Error('site.deploy not wired in local mode yet (M4 — local wrangler)'); },
-    'agent.chat': async () => { throw new Error('agent.chat not wired in local mode yet (M4 — drives your local `claude`)'); },
+    // --- preview (local dev server + cloudflared tunnel) ------------------
+    'preview.start': async (args, ctx) => {
+      const app = String(args.app || '');
+      const port = Number(args.port) || 8787;
+      const cwd = app ? resolveIn(app) : workspace;
+      let pv = previews.get(app);
+      if (pv?.url) return { url: pv.url, already: true };
+      // dev server
+      const child = spawn(args.cmd || 'npm', args.devArgs || ['run', 'dev'], { cwd, env: { ...process.env, PORT: String(port) } });
+      child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`${app || 'preview'}:out`, l); });
+      child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`${app || 'preview'}:err`, l); });
+      pv = { proc: child, tunnel: null, url: null, port };
+      previews.set(app, pv);
+      const { url, proc } = await startTunnel(port, (l) => ctx.logLine(`${app || 'preview'}:tunnel`, l));
+      pv.tunnel = proc; pv.url = url;
+      return { url };
+    },
+    'preview.restart': async (args, ctx) => { await table['preview.stop'](args); return table['preview.start'](args, ctx); },
+    'preview.stop': async (args) => {
+      const pv = previews.get(String(args.app || ''));
+      if (pv) { try { pv.tunnel?.kill(); } catch { /* gone */ } try { pv.proc?.kill(); } catch { /* gone */ } previews.delete(String(args.app || '')); }
+      return { stopped: true };
+    },
+    'preview.status': async (args) => { const pv = previews.get(String(args.app || '')); return { running: !!pv?.proc, url: pv?.url ?? null }; },
+
+    // --- publish (local wrangler) -----------------------------------------
+    'site.build': async (args, ctx) => {
+      const cwd = args.app ? resolveIn(args.app) : workspace;
+      ctx.logLine('build', 'npm run build…');
+      const { stdout, stderr } = await run('npm', ['run', 'build'], { cwd, timeout: 600_000 });
+      return { ok: true, output: (stdout + stderr).slice(-2000) };
+    },
+    'site.deploy': async (args, ctx) => {
+      const cwd = args.app ? resolveIn(args.app) : workspace;
+      ctx.logLine('deploy', 'wrangler deploy…');
+      const { stdout, stderr } = await run('npx', ['wrangler', 'deploy'], { cwd, timeout: 600_000 });
+      const out = stdout + stderr;
+      const url = (out.match(/https:\/\/[^\s]+\.workers\.dev[^\s]*/i) || [])[0] || null;
+      return { ok: true, url, output: out.slice(-2000) };
+    },
+
+    // --- agent chat (the user's OWN local CLI: claude / opencode / …) ------
+    'agent.chat': async (args, ctx) => {
+      const prompt = String(args.prompt || '').slice(0, 16000);
+      if (!prompt) return { skipped: 'empty' };
+      const app = /^[a-z][a-z0-9-]{0,30}$/.test(String(args.app || '')) ? String(args.app) : null;
+      const cwd = app ? resolveIn(app) : workspace;
+      const convId = /^[0-9a-f-]{8,40}$/i.test(String(args.conversationId || '')) ? String(args.conversationId) : null;
+      const convName = typeof args.name === 'string' ? args.name.slice(0, 80) : null;
+      const cli = /^(opencode|claude|codex|gemini)$/.test(String(args.cli || '')) ? String(args.cli) : 'claude';
+      const model = /^[a-z0-9][a-z0-9._/-]{0,60}$/i.test(String(args.model || '')) ? String(args.model) : null;
+      const key = convId || app || '__root__';
+      const started = chatStarted.has(key);
+      const { bin, argv } = buildAgentRun({ cli, prompt, convId, convName, resume: started, started, model });
+      return await new Promise((resolve) => {
+        let child;
+        try { child = spawn(bin, argv, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        catch (e) { ctx.send({ type: 'agent-data', id: ctx.id, stream: 'stderr', data: Buffer.from(`failed to start ${bin}: ${e.message}`, 'utf8').toString('base64') }); return resolve({ ok: false }); }
+        let sawOut = false;
+        const stream = (s) => (d) => { if (s === 'stdout') sawOut = true; ctx.send({ type: 'agent-data', id: ctx.id, stream: s, data: Buffer.from(d).toString('base64') }); };
+        child.stdout.on('data', stream('stdout'));
+        child.stderr.on('data', stream('stderr'));
+        child.on('error', (e) => { ctx.send({ type: 'agent-data', id: ctx.id, stream: 'stderr', data: Buffer.from(String(e.message), 'utf8').toString('base64') }); resolve({ ok: false }); });
+        child.on('close', (code) => { if (code === 0 && sawOut) chatStarted.add(key); resolve({ exitCode: code }); });
+      });
+    },
   };
 
   function dispose() {
@@ -154,6 +259,8 @@ export function makeEditorCommands({ ws }) {
     terms.clear();
     for (const r of procs.values()) { try { r.child?.kill(); } catch { /* gone */ } }
     procs.clear();
+    for (const pv of previews.values()) { try { pv.tunnel?.kill(); } catch { /* gone */ } try { pv.proc?.kill(); } catch { /* gone */ } }
+    previews.clear();
   }
 
   return { table, dispose };
