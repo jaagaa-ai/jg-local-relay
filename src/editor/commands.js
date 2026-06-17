@@ -282,6 +282,13 @@ export function makeEditorCommands({ ws, version }) {
         if (m?.commands?.start) cmd = String(m.commands.start).replace(/\$PORT/g, String(port));
       } catch { /* no manifest → default */ }
       if (/\bwrangler\s+dev\b/.test(cmd) && !/--port/.test(cmd)) cmd += ` --port ${port}`;
+      // Ensure THIS pod's deps are installed (local.setup only installs the repo
+      // root; each pod has its own node_modules — without it `wrangler` etc. are
+      // missing and the dev server can't start).
+      if (existsSync(path.join(cwd, 'package.json')) && !existsSync(path.join(cwd, 'node_modules'))) {
+        ctx.logLine(`${app || 'preview'}:out`, 'installing pod dependencies (npm install)…');
+        await run('npm', ['install', '--no-audit', '--no-fund'], { cwd, timeout: 600_000 }).catch((e) => ctx.logLine(`${app || 'preview'}:err`, `npm install failed: ${e.message}`));
+      }
       ctx.logLine(`${app || 'preview'}:out`, `starting: ${cmd}`);
       const env = { ...process.env, PORT: String(port), PATH: `${path.join(cwd, 'node_modules/.bin')}:${process.env.PATH || ''}` };
       const child = spawn('bash', ['-lc', cmd], { cwd, env });
