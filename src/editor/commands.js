@@ -303,20 +303,20 @@ export function makeEditorCommands({ ws, version }) {
       // root; each pod has its own node_modules — without it `wrangler` etc. are
       // missing and the dev server can't start).
       if (existsSync(path.join(cwd, 'package.json')) && !existsSync(path.join(cwd, 'node_modules'))) {
-        ctx.logLine(`${app || 'preview'}:out`, 'installing pod dependencies (npm install)…');
-        await run('npm', ['install', '--no-audit', '--no-fund'], { cwd, timeout: 600_000 }).catch((e) => ctx.logLine(`${app || 'preview'}:err`, `npm install failed: ${e.message}`));
+        ctx.logLine(`preview:${app || 'preview'}:out`, 'installing pod dependencies (npm install)…');
+        await run('npm', ['install', '--no-audit', '--no-fund'], { cwd, timeout: 600_000 }).catch((e) => ctx.logLine(`preview:${app || 'preview'}:err`, `npm install failed: ${e.message}`));
       }
-      ctx.logLine(`${app || 'preview'}:out`, `starting: ${cmd}`);
+      ctx.logLine(`preview:${app || 'preview'}:out`, `starting: ${cmd}`);
       const env = { ...process.env, PORT: String(port), PATH: `${path.join(cwd, 'node_modules/.bin')}:${process.env.PATH || ''}` };
       const child = spawn('bash', ['-lc', cmd], { cwd, env });
-      child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`${app || 'preview'}:out`, l); });
-      child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`${app || 'preview'}:err`, l); });
-      child.on('exit', (code) => ctx.logLine(`${app || 'preview'}:out`, `[dev server exited ${code}]`));
+      child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`preview:${app || 'preview'}:out`, l); });
+      child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`preview:${app || 'preview'}:err`, l); });
+      child.on('exit', (code) => ctx.logLine(`preview:${app || 'preview'}:out`, `[dev server exited ${code}]`));
       pv = { proc: child, tunnel: null, url: null, port: tunnelPort };
       previews.set(app, pv);
       // Tunnel logs stream on a SEPARATE channel (:tunnel) so the console can
       // show server output and tunnel output side by side.
-      const { url, proc } = await startTunnel(tunnelPort, (l) => ctx.logLine(`${app || 'preview'}:tunnel`, l));
+      const { url, proc } = await startTunnel(tunnelPort, (l) => ctx.logLine(`preview:${app || 'preview'}:tunnel`, l));
       pv.tunnel = proc; pv.url = url;
       return { url };
     },
