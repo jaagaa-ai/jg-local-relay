@@ -48,7 +48,7 @@ export function startEditorLink({ version }) {
   function connect() {
     log(`connecting → ${url} as "${relayId}"`);
     ws = new WebSocket(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
-    editor = makeEditorCommands({ ws });
+    editor = makeEditorCommands({ ws, version });
 
     ws.on('open', () => {
       backoff = 1_000;

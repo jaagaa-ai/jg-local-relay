@@ -96,7 +96,11 @@ async function mintCloneUrl(project) {
 }
 const stripToken = (url) => url.replace(/\/\/[^@/]+@/, '//'); // token-free remote
 
-export function makeEditorCommands({ ws }) {
+// Where the relay's stdout log lives (launchd StandardOutPath on macOS).
+const RELAY_LOG = process.env.JG_RELAY_LOG
+  || (process.platform === 'darwin' ? path.join(os.homedir(), 'Library/Logs/jg-local-relay/out.log') : null);
+
+export function makeEditorCommands({ ws, version }) {
   let workspace = null;            // absolute path of the active project dir
   const terms = new Map();         // termId -> Terminal
   const procs = new Map();         // name -> { child, logs:[] }
@@ -145,7 +149,34 @@ export function makeEditorCommands({ ws }) {
       }
       return { ok: true, project, workspace, action };
     },
-    'session.info': async () => ({ workspace, root: LOCAL_ROOT, terms: terms.size, procs: [...procs.keys()] }),
+    'session.info': async () => ({ workspace, root: LOCAL_ROOT, terms: terms.size, procs: [...procs.keys()], version: version ?? null, platform: process.platform, host: os.hostname(), logPath: RELAY_LOG }),
+
+    // --- local host actions (Local mode only) -----------------------------
+    // Reveal a folder/file in the OS file manager (Finder / Explorer / xdg).
+    'local.reveal': async (args) => {
+      const abs = resolveIn(args?.path || '');
+      const bin = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open';
+      try { spawn(bin, [abs], { detached: true, stdio: 'ignore' }).unref(); } catch (e) { throw new Error(`reveal failed: ${e.message}`); }
+      return { ok: true, path: abs };
+    },
+    // Open a native terminal at a folder.
+    'local.openTerminal': async (args) => {
+      const abs = resolveIn(args?.path || '');
+      try {
+        if (process.platform === 'darwin') spawn('open', ['-a', 'Terminal', abs], { detached: true, stdio: 'ignore' }).unref();
+        else if (process.platform === 'win32') spawn('cmd', ['/c', 'start', 'cmd', '/k', `cd /d ${abs}`], { detached: true, stdio: 'ignore' }).unref();
+        else spawn('x-terminal-emulator', ['--working-directory', abs], { detached: true, stdio: 'ignore' }).unref();
+      } catch (e) { throw new Error(`open terminal failed: ${e.message}`); }
+      return { ok: true, path: abs };
+    },
+    // Tail the relay's own log so the user can see what the relay is doing.
+    'local.relayLog': async (args) => {
+      if (!RELAY_LOG || !existsSync(RELAY_LOG)) return { lines: [], path: RELAY_LOG, note: 'log file not found' };
+      const n = Math.min(Math.max(Number(args?.tail) || 200, 1), 1000);
+      const txt = await readFile(RELAY_LOG, 'utf8').catch(() => '');
+      const lines = txt.split('\n').filter(Boolean);
+      return { path: RELAY_LOG, version: version ?? null, lines: lines.slice(-n) };
+    },
 
     // --- terminal (multi-PTY, addressed by termId) ------------------------
     'term.open': async (args, ctx) => {
@@ -160,14 +191,17 @@ export function makeEditorCommands({ ws }) {
 
     // --- files -------------------------------------------------------------
     'fs.list': async (args) => {
-      const abs = resolveIn(args?.path || '');
+      const rel = args?.path || '';
+      const abs = resolveIn(rel);
       const ents = await readdir(abs, { withFileTypes: true });
+      // Shape MUST match jg-sandbox-runner's fs.list (the console's FsEntry):
+      // { name, type:'dir'|'file', path } — missing path/type crashes the tree.
       return {
-        path: args?.path || '',
+        path: rel,
         entries: ents
           .filter((e) => e.name !== '.git' && e.name !== 'node_modules')
-          .map((e) => ({ name: e.name, dir: e.isDirectory() }))
-          .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1)),
+          .map((e) => ({ name: e.name, type: e.isDirectory() ? 'dir' : 'file', path: rel ? `${rel}/${e.name}` : e.name }))
+          .sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1)),
       };
     },
     'fs.read': async (args) => {
