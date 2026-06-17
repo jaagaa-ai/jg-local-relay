@@ -117,6 +117,15 @@ export function makeEditorCommands({ ws, version }) {
   const terms = new Map();         // termId -> Terminal
   const procs = new Map();         // name -> { child, logs:[] }
   const previews = new Map();      // app -> { proc, tunnel, url, port }
+  // Ring buffer of recent preview log lines per app, so the console can REPLAY
+  // them (a browser reload clears its own buffer, and a re-start of an already-
+  // running server emits nothing) → `preview.logs` returns these.
+  const previewLog = new Map();    // app -> [{ channel, line }] (capped)
+  const pushPreviewLog = (app, channel, line) => {
+    const buf = previewLog.get(app) || (previewLog.set(app, []).get(app));
+    buf.push({ channel, line });
+    if (buf.length > 800) buf.shift();
+  };
   const chatStarted = new Set();   // conv/app keys with an ongoing thread (for --continue)
   const pickTerm = (id) => (id && terms.get(id)) || (terms.size === 1 ? [...terms.values()][0] : null);
 
@@ -299,24 +308,30 @@ export function makeEditorCommands({ ws, version }) {
       // otherwise cloudflared points at a dead port and the preview never loads.
       const portInCmd = cmd.match(/--port[=\s]+(\d+)/);
       const tunnelPort = portInCmd ? Number(portInCmd[1]) : port;
+      // emit = stream live AND buffer (so `preview.logs` can replay after a
+      // console reload / when the server was already running).
+      const logKey = app || 'preview';
+      const emit = (channel, line) => { pushPreviewLog(logKey, channel, line); ctx.logLine(`preview:${logKey}:${channel}`, line); };
+      // Fresh run → reset this app's buffer so stale lines don't pile up.
+      previewLog.set(logKey, []);
       // Ensure THIS pod's deps are installed (local.setup only installs the repo
       // root; each pod has its own node_modules — without it `wrangler` etc. are
       // missing and the dev server can't start).
       if (existsSync(path.join(cwd, 'package.json')) && !existsSync(path.join(cwd, 'node_modules'))) {
-        ctx.logLine(`preview:${app || 'preview'}:out`, 'installing pod dependencies (npm install)…');
-        await run('npm', ['install', '--no-audit', '--no-fund'], { cwd, timeout: 600_000 }).catch((e) => ctx.logLine(`preview:${app || 'preview'}:err`, `npm install failed: ${e.message}`));
+        emit('out', 'installing pod dependencies (npm install)…');
+        await run('npm', ['install', '--no-audit', '--no-fund'], { cwd, timeout: 600_000 }).catch((e) => emit('err', `npm install failed: ${e.message}`));
       }
-      ctx.logLine(`preview:${app || 'preview'}:out`, `starting: ${cmd}`);
+      emit('out', `starting: ${cmd}`);
       const env = { ...process.env, PORT: String(port), PATH: `${path.join(cwd, 'node_modules/.bin')}:${process.env.PATH || ''}` };
       const child = spawn('bash', ['-lc', cmd], { cwd, env });
-      child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`preview:${app || 'preview'}:out`, l); });
-      child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`preview:${app || 'preview'}:err`, l); });
-      child.on('exit', (code) => ctx.logLine(`preview:${app || 'preview'}:out`, `[dev server exited ${code}]`));
+      child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('out', l); });
+      child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('err', l); });
+      child.on('exit', (code) => emit('out', `[dev server exited ${code}]`));
       pv = { proc: child, tunnel: null, url: null, port: tunnelPort };
       previews.set(app, pv);
       // Tunnel logs stream on a SEPARATE channel (:tunnel) so the console can
       // show server output and tunnel output side by side.
-      const { url, proc } = await startTunnel(tunnelPort, (l) => ctx.logLine(`preview:${app || 'preview'}:tunnel`, l));
+      const { url, proc } = await startTunnel(tunnelPort, (l) => emit('tunnel', l));
       pv.tunnel = proc; pv.url = url;
       return { url };
     },
@@ -325,6 +340,12 @@ export function makeEditorCommands({ ws, version }) {
       const pv = previews.get(String(args.app || ''));
       if (pv) { try { pv.tunnel?.kill(); } catch { /* gone */ } try { pv.proc?.kill(); } catch { /* gone */ } previews.delete(String(args.app || '')); }
       return { stopped: true };
+    },
+    // Replay the buffered log lines for an app (survives console reloads + the
+    // already-running case). Shape: { app, lines:[{channel,line}] }.
+    'preview.logs': async (args) => {
+      const app = String(args?.app || '');
+      return { app, lines: previewLog.get(app) ?? previewLog.get(app || 'preview') ?? [] };
     },
     'preview.status': async (args) => {
       // Same shape as jg-sandbox-runner: { app, running, ready, url, port }.
