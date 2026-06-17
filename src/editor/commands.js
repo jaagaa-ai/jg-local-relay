@@ -67,6 +67,35 @@ function startTunnel(port, onLog = () => {}) {
   });
 }
 
+// Resolve jg-api's HTTPS origin (to mint repo tokens). Mirrors link.js: explicit
+// JG_API_WS_URL, else derive from a prod cp host (cp.<d> → api.<d>).
+function apiBase() {
+  let wsUrl = process.env.JG_API_WS_URL;
+  if (!wsUrl) {
+    try { const cp = new URL(process.env.JG_CP_URL || ''); if (cp.hostname.startsWith('cp.')) wsUrl = `wss://${cp.hostname.replace(/^cp\./, 'api.')}/api/local/relay`; } catch { /* malformed */ }
+  }
+  if (!wsUrl) return null;
+  try { const u = new URL(wsUrl.replace(/^ws/, 'http')); return `${u.protocol}//${u.host}`; } catch { return null; }
+}
+
+// Ask jg-api for a SHORT-LIVED, single-repo-scoped clone URL (GitHub App token).
+// The owner never holds a broad token; we use this transiently and never persist
+// it (we reset the git remote to the token-free URL after clone).
+async function mintCloneUrl(project) {
+  const base = apiBase();
+  if (!base) throw new Error('no jg-api endpoint to mint a repo token');
+  const res = await fetch(`${base}/api/local/repo-token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
+    body: JSON.stringify({ project }),
+  });
+  if (!res.ok) throw new Error(`repo-token mint failed (${res.status})`);
+  const j = await res.json();
+  if (!j.url) throw new Error('repo-token: no url');
+  return j.url; // https://x-access-token:<tok>@github.com/<org>/jgc-<project>.git
+}
+const stripToken = (url) => url.replace(/\/\/[^@/]+@/, '//'); // token-free remote
+
 export function makeEditorCommands({ ws }) {
   let workspace = null;            // absolute path of the active project dir
   const terms = new Map();         // termId -> Terminal
@@ -93,14 +122,20 @@ export function makeEditorCommands({ ws }) {
       const dest = args.path ? path.resolve(args.path) : path.join(LOCAL_ROOT, project);
       const branch = args.branch || 'main';
       await mkdir(path.dirname(dest), { recursive: true });
+      // Repo auth = a short-lived, single-repo-scoped token minted by jg-api
+      // (NOT the owner's personal git creds). Used inline; never persisted.
+      const scopedUrl = await mintCloneUrl(project);
+      const cleanUrl = stripToken(scopedUrl);
       let action;
       if (existsSync(path.join(dest, '.git'))) {
-        await run('git', ['-C', dest, 'fetch', '--quiet']).catch(() => {});
+        await run('git', ['-C', dest, 'fetch', '--quiet', scopedUrl], { timeout: 300_000 }).catch(() => {});
         action = 'updated';
       } else {
-        if (!args.repoUrl) throw new Error('local.setup needs { repoUrl } for a first clone');
         ctx.logLine('setup', `cloning ${project} → ${dest}`);
-        await run('git', ['clone', '--quiet', '--branch', branch, args.repoUrl, dest], { timeout: 300_000 });
+        await run('git', ['clone', '--quiet', '--branch', branch, scopedUrl, dest], { timeout: 300_000 });
+        // Reset the remote to the token-free URL so the ephemeral token never
+        // lands in .git/config. Push/fetch re-mint a fresh scoped URL inline.
+        await run('git', ['-C', dest, 'remote', 'set-url', 'origin', cleanUrl]).catch(() => {});
         action = 'cloned';
       }
       workspace = dest;
@@ -182,7 +217,11 @@ export function makeEditorCommands({ ws }) {
       const msg = args.message || 'Update from Jaagaa Local Editor';
       await run('git', ['-C', workspace, 'add', '-A']);
       await run('git', ['-C', workspace, 'commit', '-m', msg]).catch((e) => ctx.logLine('git', e.stderr || 'nothing to commit'));
-      const { stdout, stderr } = await run('git', ['-C', workspace, 'push'], { timeout: 180_000 });
+      const branch = (await run('git', ['-C', workspace, 'rev-parse', '--abbrev-ref', 'HEAD']).then((r) => r.stdout.trim()).catch(() => 'main')) || 'main';
+      // Push via a fresh scoped token URL inline — never persisted in git config.
+      const project = path.basename(workspace);
+      const scopedUrl = await mintCloneUrl(project);
+      const { stdout, stderr } = await run('git', ['-C', workspace, 'push', scopedUrl, `HEAD:${branch}`], { timeout: 180_000 });
       return { ok: true, output: (stdout + stderr).trim().slice(0, 1000) };
     },
 
