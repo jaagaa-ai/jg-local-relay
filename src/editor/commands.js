@@ -10,6 +10,7 @@
 
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 import { spawn, execFile } from 'node:child_process';
 import { mkdir, readdir, readFile, writeFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -50,6 +51,17 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model }
 
 // cloudflared quick tunnel to a local port → public https URL (preview). Same
 // approach as jg-sandbox-runner/src/lib/tunnel.js.
+// Does the dev server actually answer on its port? (process-alive ≠ serving.)
+// Mirrors jg-sandbox-runner's probePort so the console can show live vs starting.
+function probePort(port) {
+  return new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port, method: 'HEAD', path: '/', timeout: 1500 }, (res) => { res.resume(); resolve(true); });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
 const QUICK_URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 function startTunnel(port, onLog = () => {}) {
   return new Promise((resolve, reject) => {
@@ -314,7 +326,16 @@ export function makeEditorCommands({ ws, version }) {
       if (pv) { try { pv.tunnel?.kill(); } catch { /* gone */ } try { pv.proc?.kill(); } catch { /* gone */ } previews.delete(String(args.app || '')); }
       return { stopped: true };
     },
-    'preview.status': async (args) => { const pv = previews.get(String(args.app || '')); return { running: !!pv?.proc, url: pv?.url ?? null }; },
+    'preview.status': async (args) => {
+      // Same shape as jg-sandbox-runner: { app, running, ready, url, port }.
+      // `ready` = the server answers on its port — the console needs this to
+      // flip the pod from "starting" to live (process-alive alone isn't enough).
+      const app = String(args.app || '');
+      const pv = previews.get(app);
+      const running = !!pv?.proc;
+      const ready = running && pv?.port ? await probePort(pv.port) : false;
+      return { app, running, ready, url: pv?.url ?? null, port: pv?.port ?? null };
+    },
 
     // --- publish (local wrangler) -----------------------------------------
     'site.build': async (args, ctx) => {
