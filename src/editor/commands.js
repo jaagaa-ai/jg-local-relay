@@ -282,6 +282,11 @@ export function makeEditorCommands({ ws, version }) {
         if (m?.commands?.start) cmd = String(m.commands.start).replace(/\$PORT/g, String(port));
       } catch { /* no manifest → default */ }
       if (/\bwrangler\s+dev\b/.test(cmd) && !/--port/.test(cmd)) cmd += ` --port ${port}`;
+      // The dev command (esp. a manifest one) may pin its OWN port (e.g.
+      // `wrangler dev --port 8788`). Tunnel THAT port, not the default arg —
+      // otherwise cloudflared points at a dead port and the preview never loads.
+      const portInCmd = cmd.match(/--port[=\s]+(\d+)/);
+      const tunnelPort = portInCmd ? Number(portInCmd[1]) : port;
       // Ensure THIS pod's deps are installed (local.setup only installs the repo
       // root; each pod has its own node_modules — without it `wrangler` etc. are
       // missing and the dev server can't start).
@@ -295,11 +300,11 @@ export function makeEditorCommands({ ws, version }) {
       child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`${app || 'preview'}:out`, l); });
       child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`${app || 'preview'}:err`, l); });
       child.on('exit', (code) => ctx.logLine(`${app || 'preview'}:out`, `[dev server exited ${code}]`));
-      pv = { proc: child, tunnel: null, url: null, port };
+      pv = { proc: child, tunnel: null, url: null, port: tunnelPort };
       previews.set(app, pv);
       // Tunnel logs stream on a SEPARATE channel (:tunnel) so the console can
       // show server output and tunnel output side by side.
-      const { url, proc } = await startTunnel(port, (l) => ctx.logLine(`${app || 'preview'}:tunnel`, l));
+      const { url, proc } = await startTunnel(tunnelPort, (l) => ctx.logLine(`${app || 'preview'}:tunnel`, l));
       pv.tunnel = proc; pv.url = url;
       return { url };
     },
