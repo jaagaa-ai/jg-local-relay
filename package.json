@@ -4,15 +4,21 @@
   "private": true,
   "type": "module",
   "description": "Thin agent that dials home to the Jaagaa control-plane (cp.jaagaa.ai) over WSS and executes local dev/ops commands on its behalf. Replaces the per-machine manager.",
-  "bin": { "jg-local-relay": "src/index.js" },
+  "bin": {
+    "jg-local-relay": "src/index.js"
+  },
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "smoke": "node test/editor-smoke.mjs",
+    "postinstall": "chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper 2>/dev/null || true"
   },
   "dependencies": {
-    "node-pty": "^1.0.0",
+    "node-pty": "^1.1.0",
     "pm2": "^5.4.3",
     "ws": "^8.18.0"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }
