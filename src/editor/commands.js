@@ -272,12 +272,26 @@ export function makeEditorCommands({ ws, version }) {
       const cwd = app ? resolveIn(app) : workspace;
       let pv = previews.get(app);
       if (pv?.url) return { url: pv.url, already: true };
-      // dev server
-      const child = spawn(args.cmd || 'npm', args.devArgs || ['run', 'dev'], { cwd, env: { ...process.env, PORT: String(port) } });
+      // Start command from the pod's jaagaa.app.json (mirrors the cloud runner);
+      // default `wrangler dev` for workers. $PORT templated. Run via bash -lc
+      // with the pod's node_modules/.bin on PATH so a locally-installed wrangler
+      // (or other dev tool) resolves without a global install.
+      let cmd = `wrangler dev --port ${port}`;
+      try {
+        const m = JSON.parse(await readFile(path.join(cwd, 'jaagaa.app.json'), 'utf8'));
+        if (m?.commands?.start) cmd = String(m.commands.start).replace(/\$PORT/g, String(port));
+      } catch { /* no manifest → default */ }
+      if (/\bwrangler\s+dev\b/.test(cmd) && !/--port/.test(cmd)) cmd += ` --port ${port}`;
+      ctx.logLine(`${app || 'preview'}:out`, `starting: ${cmd}`);
+      const env = { ...process.env, PORT: String(port), PATH: `${path.join(cwd, 'node_modules/.bin')}:${process.env.PATH || ''}` };
+      const child = spawn('bash', ['-lc', cmd], { cwd, env });
       child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`${app || 'preview'}:out`, l); });
       child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) ctx.logLine(`${app || 'preview'}:err`, l); });
+      child.on('exit', (code) => ctx.logLine(`${app || 'preview'}:out`, `[dev server exited ${code}]`));
       pv = { proc: child, tunnel: null, url: null, port };
       previews.set(app, pv);
+      // Tunnel logs stream on a SEPARATE channel (:tunnel) so the console can
+      // show server output and tunnel output side by side.
       const { url, proc } = await startTunnel(port, (l) => ctx.logLine(`${app || 'preview'}:tunnel`, l));
       pv.tunnel = proc; pv.url = url;
       return { url };
