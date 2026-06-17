@@ -17,6 +17,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { commands, adoptOrphanTunnels, restoreOwnedTunnels } from './commands.js';
+import { startEditorLink } from './editor/link.js';
 
 // Last-resort guards — even one un-caught spawn error has killed the relay
 // hard enough that launchd takes ~8s to bring us back. During that window cp
@@ -190,3 +191,8 @@ restoreOwnedTunnels()
   .catch((e) => log(`[tunnel] boot restore error: ${e.message}`));
 
 connect();
+
+// AI-Editor surface (additive, gated by JG_API_WS_URL). A second outbound WSS
+// to jg-api for the Local Editor; no-op when the env var is unset, so the
+// control-plane behavior above is completely unaffected. See src/editor/.
+try { startEditorLink({ version: VERSION }); } catch (e) { log('[editor] start failed (non-fatal):', e.message); }
