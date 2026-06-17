@@ -125,6 +125,25 @@ async function provisionNamedTunnel(project, app, port) {
   if (!j.token || !j.host) throw new Error('preview-tunnel: missing token/host');
   return { tunnelId: j.tunnelId || null, token: j.token, host: j.host };
 }
+// The tenant Core origin a pod authenticates against (Identity Phase 2). Cached
+// per project; injected as CORE_URL into the dev server so lib/coreAuth.ts can
+// verify Core tokens against the Core JWKS.
+const coreUrlCache = new Map();
+async function fetchCoreUrl(project) {
+  if (coreUrlCache.has(project)) return coreUrlCache.get(project);
+  const base = apiBase();
+  if (!base) return null;
+  try {
+    const res = await fetch(`${base}/api/local/core-url?project=${encodeURIComponent(project)}`, {
+      headers: { authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
+    });
+    if (!res.ok) return null;
+    const j = await res.json();
+    const url = j.coreUrl || null;
+    coreUrlCache.set(project, url);
+    return url;
+  } catch { return null; }
+}
 // Tear the named tunnel + its DNS down (also invalidates the run token).
 async function teardownNamedTunnel(tunnelId, host) {
   const base = apiBase();
@@ -350,7 +369,14 @@ export function makeEditorCommands({ ws, version }) {
         await run('npm', ['install', '--no-audit', '--no-fund'], { cwd, timeout: 600_000 }).catch((e) => emit('err', `npm install failed: ${e.message}`));
       }
       emit('out', `starting: ${cmd}`);
-      const env = { ...process.env, PORT: String(port), PATH: `${path.join(cwd, 'node_modules/.bin')}:${process.env.PATH || ''}` };
+      // Identity Phase 2: inject CORE_URL (tenant Core origin) + APP_ID so a
+      // `core` pod can verify Core tokens locally exactly as it would in prod.
+      const coreUrl = await fetchCoreUrl(path.basename(workspace)).catch(() => null);
+      const env = {
+        ...process.env, PORT: String(port),
+        ...(coreUrl ? { CORE_URL: coreUrl } : {}), APP_ID: app || 'web',
+        PATH: `${path.join(cwd, 'node_modules/.bin')}:${process.env.PATH || ''}`,
+      };
       const child = spawn('bash', ['-lc', cmd], { cwd, env });
       child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('out', l); });
       child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('err', l); });
