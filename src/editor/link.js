@@ -50,12 +50,20 @@ export function startEditorLink({ version }) {
     ws = new WebSocket(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
     editor = makeEditorCommands({ ws, version });
 
+    let alive = true;
+    ws.on('pong', () => { alive = true; });
     ws.on('open', () => {
       backoff = 1_000;
+      alive = true;
       send(ws, { type: 'hello', token, relay: { id: relayId, host: os.hostname(), user: os.userInfo().username, platform: process.platform, version, surface: 'editor' } });
       log('connected; sent hello (surface=editor)');
       clearInterval(heartbeat);
-      heartbeat = setInterval(() => send(ws, { type: 'pong', ts: Date.now() }), HEARTBEAT_MS);
+      // ws-level ping; terminate if jg-api misses a pong (half-open after a
+      // redeploy) so the 'close' handler reconnects instead of sitting dead.
+      heartbeat = setInterval(() => {
+        if (!alive) { log('no pong — terminating dead editor link'); try { ws.terminate(); } catch { /* gone */ } return; }
+        alive = false; try { ws.ping(); } catch { /* gone */ }
+      }, HEARTBEAT_MS);
     });
 
     ws.on('message', (raw) => {
