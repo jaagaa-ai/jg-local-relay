@@ -241,11 +241,17 @@ export function makeEditorCommands({ ws, version }) {
       return { changes: stdout.split('\n').filter(Boolean).map((l) => ({ status: l.slice(0, 2).trim(), file: l.slice(3) })) };
     },
     'repo.status': async () => {
-      const [branch, porcelain] = await Promise.all([
+      // Full shape the console's repo bar expects (matches jg-sandbox-runner):
+      // { hasRepo, branch, head, fileCount, dirty, remote }.
+      if (!workspace || !existsSync(path.join(workspace, '.git'))) return { hasRepo: false };
+      const [branch, head, porcelain, remote, files] = await Promise.all([
         run('git', ['-C', workspace, 'rev-parse', '--abbrev-ref', 'HEAD']).then((r) => r.stdout.trim()).catch(() => null),
+        run('git', ['-C', workspace, 'rev-parse', '--short', 'HEAD']).then((r) => r.stdout.trim()).catch(() => null),
         run('git', ['-C', workspace, 'status', '--porcelain']).then((r) => r.stdout).catch(() => ''),
+        run('git', ['-C', workspace, 'remote', 'get-url', 'origin']).then((r) => r.stdout.trim()).catch(() => null),
+        run('git', ['-C', workspace, 'ls-files']).then((r) => r.stdout.split('\n').filter(Boolean).length).catch(() => 0),
       ]);
-      return { branch, dirty: porcelain.split('\n').filter(Boolean).length };
+      return { hasRepo: true, branch, head, fileCount: files, dirty: porcelain.split('\n').filter(Boolean).length, remote };
     },
     'repo.push': async (args, ctx) => {
       const msg = args.message || 'Update from Jaagaa Local Editor';
