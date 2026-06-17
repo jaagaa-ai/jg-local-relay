@@ -20,9 +20,22 @@ import { runCommand, send } from './protocol.js';
 const HEARTBEAT_MS = 25_000;
 const MAX_BACKOFF_MS = 30_000;
 
+// Resolve the jg-api editor endpoint. Explicit JG_API_WS_URL wins; otherwise,
+// in PRODUCTION (cp host = cp.<domain>) derive it as api.<domain> so the relay
+// enables Local mode automatically after its built-in self-update — no manual
+// env. Dev/unknown cp hosts stay OFF unless JG_API_WS_URL is set explicitly.
+function resolveEditorUrl() {
+  if (process.env.JG_API_WS_URL) return process.env.JG_API_WS_URL;
+  try {
+    const cp = new URL(process.env.JG_CP_URL || '');
+    if (cp.hostname.startsWith('cp.')) return `wss://${cp.hostname.replace(/^cp\./, 'api.')}/api/local/relay`;
+  } catch { /* malformed cp url */ }
+  return '';
+}
+
 export function startEditorLink({ version }) {
-  const url = process.env.JG_API_WS_URL;
-  if (!url) return; // feature off → cp path untouched
+  const url = resolveEditorUrl();
+  if (!url) return; // feature off (no explicit url + non-prod cp) → cp path untouched
   const token = process.env.JG_RELAY_TOKEN || '';
   const relayId = process.env.JG_RELAY_ID || os.hostname();
   const log = (...a) => console.log(new Date().toISOString(), '[editor]', ...a);
