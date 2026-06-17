@@ -108,6 +108,34 @@ async function mintCloneUrl(project) {
 }
 const stripToken = (url) => url.replace(/\/\/[^@/]+@/, '//'); // token-free remote
 
+// Ask jg-api to provision a NAMED jaagaa.ai preview tunnel for ONE app. jg-api
+// owns the CF API; we only receive a run token scoped to this single tunnel
+// (ingress remotely-managed: this app's host → our localhost:<port>, nothing
+// else). Returns { tunnelId, token, host }. Throws → caller uses a quick tunnel.
+async function provisionNamedTunnel(project, app, port) {
+  const base = apiBase();
+  if (!base) throw new Error('no jg-api endpoint');
+  const res = await fetch(`${base}/api/local/preview-tunnel`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
+    body: JSON.stringify({ project, app, port }),
+  });
+  if (!res.ok) throw new Error(`preview-tunnel ${res.status}`);
+  const j = await res.json();
+  if (!j.token || !j.host) throw new Error('preview-tunnel: missing token/host');
+  return { tunnelId: j.tunnelId || null, token: j.token, host: j.host };
+}
+// Tear the named tunnel + its DNS down (also invalidates the run token).
+async function teardownNamedTunnel(tunnelId, host) {
+  const base = apiBase();
+  if (!base || !tunnelId) return;
+  await fetch(`${base}/api/local/preview-tunnel/teardown`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
+    body: JSON.stringify({ tunnelId, host }),
+  }).catch(() => {});
+}
+
 // Where the relay's stdout log lives (launchd StandardOutPath on macOS).
 const RELAY_LOG = process.env.JG_RELAY_LOG
   || (process.platform === 'darwin' ? path.join(os.homedir(), 'Library/Logs/jg-local-relay/out.log') : null);
@@ -327,18 +355,36 @@ export function makeEditorCommands({ ws, version }) {
       child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('out', l); });
       child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('err', l); });
       child.on('exit', (code) => emit('out', `[dev server exited ${code}]`));
-      pv = { proc: child, tunnel: null, url: null, port: tunnelPort };
+      pv = { proc: child, tunnel: null, url: null, port: tunnelPort, tunnelId: null, tunnelHost: null };
       previews.set(app, pv);
-      // Tunnel logs stream on a SEPARATE channel (:tunnel) so the console can
-      // show server output and tunnel output side by side.
-      const { url, proc } = await startTunnel(tunnelPort, (l) => emit('tunnel', l));
-      pv.tunnel = proc; pv.url = url;
+      // Prefer a NAMED jaagaa.ai tunnel (jgc-<app>-<slug>-local.jaagaa.ai),
+      // provisioned by jg-api + scoped to this one app. Fall back to a zero-
+      // config quick tunnel (*.trycloudflare.com) if jg-api/CF is unavailable.
+      // Tunnel logs stream on the :tunnel channel for the side-by-side view.
+      try {
+        const prov = await provisionNamedTunnel(path.basename(workspace), logKey, tunnelPort);
+        const cf = spawn('cloudflared', ['tunnel', '--no-autoupdate', 'run', '--token', prov.token], { env: process.env });
+        cf.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l.trim()) emit('tunnel', l.trim()); });
+        cf.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l.trim()) emit('tunnel', l.trim()); });
+        pv.tunnel = cf; pv.url = prov.host; pv.tunnelId = prov.tunnelId; pv.tunnelHost = prov.host;
+        emit('tunnel', `named preview tunnel: ${prov.host} (a few seconds to route)`);
+      } catch (e) {
+        emit('tunnel', `named tunnel unavailable (${e.message}); using a quick tunnel`);
+        const { url, proc } = await startTunnel(tunnelPort, (l) => emit('tunnel', l));
+        pv.tunnel = proc; pv.url = url;
+      }
       return { url };
     },
     'preview.restart': async (args, ctx) => { await table['preview.stop'](args); return table['preview.start'](args, ctx); },
     'preview.stop': async (args) => {
       const pv = previews.get(String(args.app || ''));
-      if (pv) { try { pv.tunnel?.kill(); } catch { /* gone */ } try { pv.proc?.kill(); } catch { /* gone */ } previews.delete(String(args.app || '')); }
+      if (pv) {
+        try { pv.tunnel?.kill(); } catch { /* gone */ }
+        try { pv.proc?.kill(); } catch { /* gone */ }
+        // Delete the named tunnel + DNS server-side (invalidates the run token).
+        if (pv.tunnelId) void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost);
+        previews.delete(String(args.app || ''));
+      }
       return { stopped: true };
     },
     // Replay the buffered log lines for an app (survives console reloads + the
@@ -406,7 +452,11 @@ export function makeEditorCommands({ ws, version }) {
     terms.clear();
     for (const r of procs.values()) { try { r.child?.kill(); } catch { /* gone */ } }
     procs.clear();
-    for (const pv of previews.values()) { try { pv.tunnel?.kill(); } catch { /* gone */ } try { pv.proc?.kill(); } catch { /* gone */ } }
+    for (const pv of previews.values()) {
+      try { pv.tunnel?.kill(); } catch { /* gone */ }
+      try { pv.proc?.kill(); } catch { /* gone */ }
+      if (pv.tunnelId) void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost);
+    }
     previews.clear();
   }
 
