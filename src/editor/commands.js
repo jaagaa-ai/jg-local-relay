@@ -18,6 +18,11 @@ import { Terminal } from './terminal.js';
 
 const LOCAL_ROOT = process.env.JG_LOCAL_ROOT || path.join(os.homedir(), 'Documents', 'Jaagaa-ai');
 
+// This relay's stable id — same value sent in the dial-home hello frame, so
+// jg-api can correlate a resource-mint REST call to the live bridged session and
+// refuse minting another account's project (account-isolation backstop).
+const RELAY_ID = process.env.JG_RELAY_ID || os.hostname();
+
 const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
   execFile(cmd, args, { timeout: 120_000, maxBuffer: 16 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
     if (err) { err.stderr = stderr; reject(err); } else resolve({ stdout: String(stdout), stderr: String(stderr) });
@@ -99,7 +104,7 @@ async function mintCloneUrl(project) {
   const res = await fetch(`${base}/api/local/repo-token`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
-    body: JSON.stringify({ project }),
+    body: JSON.stringify({ project, relay: RELAY_ID }),
   });
   if (!res.ok) throw new Error(`repo-token mint failed (${res.status})`);
   const j = await res.json();
@@ -118,7 +123,7 @@ async function provisionNamedTunnel(project, app, port) {
   const res = await fetch(`${base}/api/local/preview-tunnel`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
-    body: JSON.stringify({ project, app, port }),
+    body: JSON.stringify({ project, app, port, relay: RELAY_ID }),
   });
   if (!res.ok) throw new Error(`preview-tunnel ${res.status}`);
   const j = await res.json();
@@ -134,7 +139,7 @@ async function fetchCoreUrl(project) {
   const base = apiBase();
   if (!base) return null;
   try {
-    const res = await fetch(`${base}/api/local/core-url?project=${encodeURIComponent(project)}`, {
+    const res = await fetch(`${base}/api/local/core-url?project=${encodeURIComponent(project)}&relay=${encodeURIComponent(RELAY_ID)}`, {
       headers: { authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
     });
     if (!res.ok) return null;
@@ -372,12 +377,20 @@ export function makeEditorCommands({ ws, version }) {
       // Identity Phase 2: inject CORE_URL (tenant Core origin) + APP_ID so a
       // `core` pod can verify Core tokens locally exactly as it would in prod.
       const coreUrl = await fetchCoreUrl(path.basename(workspace)).catch(() => null);
+      const binDir = path.join(cwd, 'node_modules/.bin');
       const env = {
         ...process.env, PORT: String(port),
         ...(coreUrl ? { CORE_URL: coreUrl } : {}), APP_ID: app || 'web',
-        PATH: `${path.join(cwd, 'node_modules/.bin')}:${process.env.PATH || ''}`,
+        PATH: `${binDir}:${process.env.PATH || ''}`,
       };
-      const child = spawn('bash', ['-lc', cmd], { cwd, env });
+      // We pass PATH in env AND re-export it inside the command. The env prefix
+      // alone is not enough: `bash -lc` is a LOGIN shell, and on macOS /etc/profile
+      // runs path_helper which RESETS PATH to the system default — wiping our
+      // node_modules/.bin prefix before `cmd` ever runs (→ `wrangler: command not
+      // found`, exit 127). Re-exporting inside the command runs AFTER profile init,
+      // so the pod's local bins (wrangler, vite, etc.) resolve without a global install.
+      const shellCmd = `export PATH="${binDir}:$PATH"; ${cmd}`;
+      const child = spawn('bash', ['-lc', shellCmd], { cwd, env });
       child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('out', l); });
       child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('err', l); });
       child.on('exit', (code) => emit('out', `[dev server exited ${code}]`));
