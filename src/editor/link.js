@@ -43,12 +43,23 @@ export function startEditorLink({ version }) {
   let ws = null;
   let backoff = 1_000;
   let heartbeat = null;
-  let editor = null; // { table, dispose } — fresh per connection
+  // ISOLATION: one command-table instance PER PROJECT, not one global. Each
+  // instance owns its own workspace/previews/procs/terms closure, so two
+  // project tabs driving the same relay can never see each other's workspace or
+  // dev server. Routed by the command's `args.project`.
+  let editors = new Map(); // project -> { table, dispose }
+  const editorFor = (project) => {
+    const key = String(project || '__default__');
+    let e = editors.get(key);
+    if (!e) { e = makeEditorCommands({ ws, version }); editors.set(key, e); log(`spawned editor session for project "${key}"`); }
+    return e;
+  };
+  const disposeAll = () => { for (const e of editors.values()) { try { e.dispose(); } catch { /* gone */ } } editors = new Map(); };
 
   function connect() {
     log(`connecting → ${url} as "${relayId}"`);
     ws = new WebSocket(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
-    editor = makeEditorCommands({ ws, version });
+    disposeAll();
 
     let alive = true;
     ws.on('pong', () => { alive = true; });
@@ -69,12 +80,13 @@ export function startEditorLink({ version }) {
     ws.on('message', (raw) => {
       let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === 'ping') return send(ws, { type: 'pong', ts: Date.now() });
-      if (msg.type === 'command') return void runCommand(ws, editor.table, msg);
+      // Route to the per-project editor session (isolated workspace + processes).
+      if (msg.type === 'command') return void runCommand(ws, editorFor(msg.args?.project).table, msg);
     });
 
     ws.on('close', () => {
       clearInterval(heartbeat);
-      try { editor?.dispose(); } catch { /* gone */ }
+      disposeAll();
       const wait = Math.min(backoff, MAX_BACKOFF_MS);
       log(`disconnected; reconnecting in ${wait}ms`);
       setTimeout(connect, wait);

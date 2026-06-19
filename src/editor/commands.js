@@ -29,6 +29,17 @@ const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
   });
 });
 
+// A STABLE, project+app-unique local port (8800–9799). Two different projects'
+// `web` pods must never share a port, or their dev servers collide on 8787 (and
+// a port-probe for one would falsely detect the other → wrong preview, false
+// "running" dots). Deterministic so the port survives restarts.
+function stablePort(project, app) {
+  const s = `${project || 'app'}:${app || 'web'}`;
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return 8800 + (h % 1000);
+}
+
 // SIGKILL whatever process is bound to a local TCP port. We call this before
 // (re)starting a dev server so a LEFTOVER process — orphaned by a relay restart
 // (launchd SIGKILLs us, so our children outlive us and keep holding the port) or
@@ -356,7 +367,10 @@ export function makeEditorCommands({ ws, version }) {
     // --- preview (local dev server + cloudflared tunnel) ------------------
     'preview.start': async (args, ctx) => {
       const app = String(args.app || '');
-      const port = Number(args.port) || 8787;
+      const project = String(args.project || path.basename(workspace || '') || 'app');
+      // Unique port per (project, app) — NOT a shared 8787 — so concurrent
+      // projects' dev servers never collide or cross-detect each other.
+      const port = stablePort(project, app);
       const cwd = app ? resolveIn(app) : workspace;
       let pv = previews.get(app);
       // Start command from the pod's jaagaa.app.json (mirrors the cloud runner);
@@ -368,12 +382,13 @@ export function makeEditorCommands({ ws, version }) {
         const m = JSON.parse(await readFile(path.join(cwd, 'jaagaa.app.json'), 'utf8'));
         if (m?.commands?.start) cmd = String(m.commands.start).replace(/\$PORT/g, String(port));
       } catch { /* no manifest → default */ }
-      if (/\bwrangler\s+dev\b/.test(cmd) && !/--port/.test(cmd)) cmd += ` --port ${port}`;
-      // The dev command (esp. a manifest one) may pin its OWN port (e.g.
-      // `wrangler dev --port 8788`). Tunnel THAT port, not the default arg —
-      // otherwise cloudflared points at a dead port and the preview never loads.
-      const portInCmd = cmd.match(/--port[=\s]+(\d+)/);
-      const tunnelPort = portInCmd ? Number(portInCmd[1]) : port;
+      // Force the unique per-project port — OVERRIDE any port the manifest
+      // hardcoded, so two projects whose manifests both say `--port 8787` still
+      // get distinct ports and never collide / cross-detect.
+      if (/\bwrangler\s+dev\b/.test(cmd)) {
+        cmd = /--port[=\s]+\d+/.test(cmd) ? cmd.replace(/--port[=\s]+\d+/, `--port ${port}`) : `${cmd} --port ${port}`;
+      }
+      const tunnelPort = port;
       // emit = stream live AND buffer (so `preview.logs` can replay after a
       // console reload / when the server was already running).
       const logKey = app || 'preview';
@@ -485,8 +500,11 @@ export function makeEditorCommands({ ws, version }) {
       // browser refresh. That's what lets the console keep showing live
       // processes across reloads instead of resetting to idle.
       const app = String(args.app || '');
+      const project = String(args.project || path.basename(workspace || '') || 'app');
       const pv = previews.get(app);
-      const port = pv?.port ?? (Number(args.port) || null);
+      // Probe THIS project's unique port (never a shared 8787), so a server from
+      // another project can't make this pod look running.
+      const port = pv?.port ?? stablePort(project, app);
       const ready = port ? await probePort(port) : false;
       const running = !!pv?.proc || ready;
       return { app, running, ready, url: pv?.url ?? null, port };
