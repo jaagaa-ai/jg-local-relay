@@ -382,11 +382,21 @@ export function makeEditorCommands({ ws, version }) {
         const m = JSON.parse(await readFile(path.join(cwd, 'jaagaa.app.json'), 'utf8'));
         if (m?.commands?.start) cmd = String(m.commands.start).replace(/\$PORT/g, String(port));
       } catch { /* no manifest → default */ }
+      // Data environment: 'development' (default) = local miniflare data, fully
+      // isolated + mutable. 'production' = the pod's REAL prod D1/R2 via
+      // `--remote`, with JG_ENV=prod (read-only, enforced in the pod's envGuard)
+      // unless prodWrite unlocked it (JG_ENV=prod-rw). Omitted → development, so
+      // existing callers are unchanged.
+      const dataEnv = args.env === 'production' ? 'production' : 'development';
+      const prodWrite = dataEnv === 'production' && !!args.prodWrite;
       // Force the unique per-project port — OVERRIDE any port the manifest
       // hardcoded, so two projects whose manifests both say `--port 8787` still
       // get distinct ports and never collide / cross-detect.
       if (/\bwrangler\s+dev\b/.test(cmd)) {
         cmd = /--port[=\s]+\d+/.test(cmd) ? cmd.replace(/--port[=\s]+\d+/, `--port ${port}`) : `${cmd} --port ${port}`;
+        // Production data → bind the real CF resources with --remote (default
+        // wrangler dev is LOCAL miniflare = isolated dev data).
+        if (dataEnv === 'production' && !/--remote\b/.test(cmd)) cmd += ' --remote';
       }
       const tunnelPort = port;
       // emit = stream live AND buffer (so `preview.logs` can replay after a
@@ -437,8 +447,13 @@ export function makeEditorCommands({ ws, version }) {
       const env = {
         ...process.env, PORT: String(port),
         ...(coreUrl ? { CORE_URL: coreUrl } : {}), APP_ID: app || 'web',
+        // JG_ENV drives the pod's read-only guard: 'prod' = production data,
+        // read-only; 'prod-rw' = production with writes unlocked; 'dev' = local
+        // isolated data, mutable. App code never reads this — only envGuard does.
+        JG_ENV: dataEnv === 'production' ? (prodWrite ? 'prod-rw' : 'prod') : 'dev',
         PATH: `${binDir}:${process.env.PATH || ''}`,
       };
+      if (dataEnv === 'production') emit('out', `⚠ PRODUCTION data (${prodWrite ? 'READ-WRITE' : 'read-only'}) — --remote bindings`);
       // We pass PATH in env AND re-export it inside the command. The env prefix
       // alone is not enough: `bash -lc` is a LOGIN shell, and on macOS /etc/profile
       // runs path_helper which RESETS PATH to the system default — wiping our
@@ -453,7 +468,7 @@ export function makeEditorCommands({ ws, version }) {
       child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('out', l); });
       child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('err', l); });
       child.on('exit', (code) => emit('out', `[dev server exited ${code}]`));
-      pv = { proc: child, tunnel: null, url: null, port: tunnelPort, tunnelId: null, tunnelHost: null };
+      pv = { proc: child, tunnel: null, url: null, port: tunnelPort, tunnelId: null, tunnelHost: null, dataEnv, prodWrite };
       previews.set(app, pv);
       // Prefer a NAMED jaagaa.ai tunnel (jgc-<app>-<slug>-local.jaagaa.ai),
       // provisioned by jg-api + scoped to this one app. Fall back to a zero-
@@ -507,7 +522,9 @@ export function makeEditorCommands({ ws, version }) {
       const port = pv?.port ?? stablePort(project, app);
       const ready = port ? await probePort(port) : false;
       const running = !!pv?.proc || ready;
-      return { app, running, ready, url: pv?.url ?? null, port };
+      // Report the live data environment so the console can show the env badge
+      // (Development / Production) + the read-only/write state.
+      return { app, running, ready, url: pv?.url ?? null, port, dataEnv: pv?.dataEnv ?? null, prodWrite: pv?.prodWrite ?? false };
     },
 
     // --- publish (local wrangler) -----------------------------------------
