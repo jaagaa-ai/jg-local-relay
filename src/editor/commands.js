@@ -299,6 +299,8 @@ export function makeEditorCommands({ ws, version }) {
       });
       const rec = { child, logs: [] };
       procs.set(name, rec);
+      // Without an 'error' handler a failed spawn (ENOENT etc.) crashes the relay.
+      child.on('error', (err) => { ctx.logLine(`${name}:err`, `failed to start: ${err.message}`); rec.child = null; });
       const pipe = (stream) => (buf) => { for (const line of String(buf).split('\n')) if (line) ctx.logLine(`${name}:${stream}`, line); };
       child.stdout.on('data', pipe('out'));
       child.stderr.on('data', pipe('err'));
@@ -378,6 +380,19 @@ export function makeEditorCommands({ ws, version }) {
       // `core` pod can verify Core tokens locally exactly as it would in prod.
       const coreUrl = await fetchCoreUrl(path.basename(workspace)).catch(() => null);
       const binDir = path.join(cwd, 'node_modules/.bin');
+      // Resolve the dev command's leading binary. If it's a bare CLI (e.g.
+      // `wrangler`) that the pod did NOT install as a dependency — and isn't a
+      // shell wrapper — run it via `npx --yes` so it's fetched/resolved on demand.
+      // Without this, a scaffolded pod whose package.json declares `wrangler dev`
+      // but not wrangler-as-a-dep fails with exit 127 (`command not found`).
+      // Generic: works for any pod + any CLI, and npx prefers a pod-local/global
+      // install when present.
+      const lead = cmd.trim().split(/\s+/)[0];
+      const wrapped = /^(npm|npx|node|bash|sh|pnpm|yarn|bun|\.|\/)/.test(lead);
+      if (!wrapped && !existsSync(path.join(binDir, lead))) {
+        emit('out', `'${lead}' is not installed in this pod — running it via npx`);
+        cmd = `npx --yes ${cmd}`;
+      }
       const env = {
         ...process.env, PORT: String(port),
         ...(coreUrl ? { CORE_URL: coreUrl } : {}), APP_ID: app || 'web',
@@ -391,6 +406,9 @@ export function makeEditorCommands({ ws, version }) {
       // so the pod's local bins (wrangler, vite, etc.) resolve without a global install.
       const shellCmd = `export PATH="${binDir}:$PATH"; ${cmd}`;
       const child = spawn('bash', ['-lc', shellCmd], { cwd, env });
+      // A spawn 'error' (e.g. bash missing) with no handler crashes the WHOLE
+      // relay process — surface it as a log line instead.
+      child.on('error', (e) => emit('err', `failed to start dev server: ${e.message}`));
       child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('out', l); });
       child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('err', l); });
       child.on('exit', (code) => emit('out', `[dev server exited ${code}]`));
