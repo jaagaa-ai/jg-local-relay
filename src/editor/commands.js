@@ -29,6 +29,19 @@ const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
   });
 });
 
+// SIGKILL whatever process is bound to a local TCP port. We call this before
+// (re)starting a dev server so a LEFTOVER process — orphaned by a relay restart
+// (launchd SIGKILLs us, so our children outlive us and keep holding the port) or
+// a double-start — can't cause EADDRINUSE (`Address already in use`, exit 1).
+async function freePort(port) {
+  try {
+    const { stdout } = await run('lsof', ['-ti', `tcp:${port}`], { timeout: 5000 });
+    const pids = [...new Set(stdout.split('\n').map((s) => s.trim()).filter(Boolean))];
+    for (const pid of pids) { try { process.kill(Number(pid), 'SIGKILL'); } catch { /* already gone */ } }
+    return pids.length;
+  } catch { return 0; } // lsof exits non-zero when nothing is on the port
+}
+
 // Which coding CLI drives a chat turn + its argv. Mirrors jg-sandbox-runner's
 // buildAgentRun, but LOCAL: the CLI runs under the user's OWN $HOME, so it uses
 // their real `claude` subscription / config — no XDG sandbox overrides.
@@ -346,7 +359,6 @@ export function makeEditorCommands({ ws, version }) {
       const port = Number(args.port) || 8787;
       const cwd = app ? resolveIn(app) : workspace;
       let pv = previews.get(app);
-      if (pv?.url) return { url: pv.url, already: true };
       // Start command from the pod's jaagaa.app.json (mirrors the cloud runner);
       // default `wrangler dev` for workers. $PORT templated. Run via bash -lc
       // with the pod's node_modules/.bin on PATH so a locally-installed wrangler
@@ -366,6 +378,20 @@ export function makeEditorCommands({ ws, version }) {
       // console reload / when the server was already running).
       const logKey = app || 'preview';
       const emit = (channel, line) => { pushPreviewLog(logKey, channel, line); ctx.logLine(`preview:${logKey}:${channel}`, line); };
+      // ALWAYS (re)start cleanly: tear down any process/tunnel we're tracking for
+      // this app, then free the port — a leftover dev server (orphaned by a relay
+      // restart, or a double-start) otherwise causes EADDRINUSE (exit 1). Net:
+      // exactly one running dev server per app, never two. (Per owner request:
+      // Start = restart.)
+      if (pv) {
+        try { pv.tunnel?.kill(); } catch { /* gone */ }
+        try { pv.proc?.kill(); } catch { /* gone */ }
+        if (pv.tunnelId) void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost);
+        previews.delete(app);
+        pv = undefined;
+      }
+      const freed = await freePort(tunnelPort);
+      if (freed) emit('out', `freed port ${tunnelPort} (killed ${freed} leftover process${freed > 1 ? 'es' : ''}) before restart`);
       // Fresh run → reset this app's buffer so stale lines don't pile up.
       previewLog.set(logKey, []);
       // Ensure THIS pod's deps are installed (local.setup only installs the repo
@@ -452,13 +478,18 @@ export function makeEditorCommands({ ws, version }) {
     },
     'preview.status': async (args) => {
       // Same shape as jg-sandbox-runner: { app, running, ready, url, port }.
-      // `ready` = the server answers on its port — the console needs this to
-      // flip the pod from "starting" to live (process-alive alone isn't enough).
+      // `ready` = the server answers on its port. We probe the port DIRECTLY
+      // (off the tracked child OR the port the console passes) so a dev server
+      // that's actually serving shows as running even when we're not tracking
+      // its child object — e.g. after a relay restart orphaned it, or after a
+      // browser refresh. That's what lets the console keep showing live
+      // processes across reloads instead of resetting to idle.
       const app = String(args.app || '');
       const pv = previews.get(app);
-      const running = !!pv?.proc;
-      const ready = running && pv?.port ? await probePort(pv.port) : false;
-      return { app, running, ready, url: pv?.url ?? null, port: pv?.port ?? null };
+      const port = pv?.port ?? (Number(args.port) || null);
+      const ready = port ? await probePort(port) : false;
+      const running = !!pv?.proc || ready;
+      return { app, running, ready, url: pv?.url ?? null, port };
     },
 
     // --- publish (local wrangler) -----------------------------------------
