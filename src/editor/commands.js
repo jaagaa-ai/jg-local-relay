@@ -355,8 +355,12 @@ export function makeEditorCommands({ ws, version }) {
 
     // --- git ---------------------------------------------------------------
     'git.changes': async () => {
+      // Shape MUST match jg-sandbox-runner + the console: { files: [{status, path}] }.
+      // The console reads `files`/`path` (NOT `changes`/`file`) and attributes
+      // each change to its pod by path prefix (e.g. `vault/…` → vault gets the
+      // dirty `*`). Paths are relative to the repo root.
       const { stdout } = await run('git', ['-C', workspace, 'status', '--porcelain']);
-      return { changes: stdout.split('\n').filter(Boolean).map((l) => ({ status: l.slice(0, 2).trim(), file: l.slice(3) })) };
+      return { files: stdout.split('\n').filter(Boolean).map((l) => ({ status: l.slice(0, 2).trim(), path: l.slice(3) })) };
     },
     'repo.status': async () => {
       // Full shape the console's repo bar expects (matches jg-sandbox-runner):
