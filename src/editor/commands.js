@@ -44,13 +44,32 @@ function stablePort(project, app) {
 // (re)starting a dev server so a LEFTOVER process — orphaned by a relay restart
 // (launchd SIGKILLs us, so our children outlive us and keep holding the port) or
 // a double-start — can't cause EADDRINUSE (`Address already in use`, exit 1).
-async function freePort(port) {
-  try {
-    const { stdout } = await run('lsof', ['-ti', `tcp:${port}`], { timeout: 5000 });
-    const pids = [...new Set(stdout.split('\n').map((s) => s.trim()).filter(Boolean))];
-    for (const pid of pids) { try { process.kill(Number(pid), 'SIGKILL'); } catch { /* already gone */ } }
-    return pids.length;
-  } catch { return 0; } // lsof exits non-zero when nothing is on the port
+async function freePort(port, tries = 10) {
+  // Poll-and-kill until the port is actually free. A single pass isn't enough:
+  // wrangler RESPAWNS its workerd child when it dies, so killing only the
+  // port-holder lets the still-alive wrangler immediately rebind. We retry (and
+  // killGroup below kills the wrangler parent) until lsof reports the port free.
+  let killed = 0;
+  for (let i = 0; i < tries; i++) {
+    let pids = [];
+    try {
+      const { stdout } = await run('lsof', ['-ti', `tcp:${port}`], { timeout: 5000 });
+      pids = [...new Set(stdout.split('\n').map((s) => s.trim()).filter(Boolean))];
+    } catch { /* lsof exits non-zero when nothing is on the port → free */ }
+    if (pids.length === 0) return killed; // free
+    for (const pid of pids) { try { process.kill(Number(pid), 'SIGKILL'); } catch { /* gone */ } killed++; }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return killed;
+}
+
+// Kill an entire dev-server process tree. We spawn `bash -lc "wrangler dev"`
+// DETACHED (its own process group), so SIGKILL to the negative pid takes down
+// bash + wrangler + workerd together — otherwise killing bash orphans wrangler,
+// which keeps respawning workerd on the port (→ EADDRINUSE on restart).
+function killGroup(child) {
+  if (!child?.pid) return;
+  try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }
 }
 
 // Which coding CLI drives a chat turn + its argv. Mirrors jg-sandbox-runner's
@@ -410,7 +429,7 @@ export function makeEditorCommands({ ws, version }) {
       // Start = restart.)
       if (pv) {
         try { pv.tunnel?.kill(); } catch { /* gone */ }
-        try { pv.proc?.kill(); } catch { /* gone */ }
+        killGroup(pv.proc);
         if (pv.tunnelId) void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost);
         previews.delete(app);
         pv = undefined;
@@ -461,7 +480,10 @@ export function makeEditorCommands({ ws, version }) {
       // found`, exit 127). Re-exporting inside the command runs AFTER profile init,
       // so the pod's local bins (wrangler, vite, etc.) resolve without a global install.
       const shellCmd = `export PATH="${binDir}:$PATH"; ${cmd}`;
-      const child = spawn('bash', ['-lc', shellCmd], { cwd, env });
+      // detached → own process group, so killGroup() can take down bash +
+      // wrangler + workerd together on stop/restart (prevents wrangler from
+      // respawning workerd and re-grabbing the port → EADDRINUSE).
+      const child = spawn('bash', ['-lc', shellCmd], { cwd, env, detached: true });
       // A spawn 'error' (e.g. bash missing) with no handler crashes the WHOLE
       // relay process — surface it as a log line instead.
       child.on('error', (e) => emit('err', `failed to start dev server: ${e.message}`));
@@ -493,7 +515,7 @@ export function makeEditorCommands({ ws, version }) {
       const pv = previews.get(String(args.app || ''));
       if (pv) {
         try { pv.tunnel?.kill(); } catch { /* gone */ }
-        try { pv.proc?.kill(); } catch { /* gone */ }
+        killGroup(pv.proc);
         // Delete the named tunnel + DNS server-side (invalidates the run token).
         if (pv.tunnelId) void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost);
         previews.delete(String(args.app || ''));
@@ -577,7 +599,7 @@ export function makeEditorCommands({ ws, version }) {
     procs.clear();
     for (const pv of previews.values()) {
       try { pv.tunnel?.kill(); } catch { /* gone */ }
-      try { pv.proc?.kill(); } catch { /* gone */ }
+      killGroup(pv.proc);
       if (pv.tunnelId) void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost);
     }
     previews.clear();
