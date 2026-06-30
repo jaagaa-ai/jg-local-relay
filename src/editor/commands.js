@@ -156,6 +156,23 @@ async function mintCloneUrl(project) {
 }
 const stripToken = (url) => url.replace(/\/\/[^@/]+@/, '//'); // token-free remote
 
+// Tell jg-api the tenant's `web` marketing pod was just published so it binds
+// POD_WEB on the core worker and serves marketing from the pod (not the baked
+// template). Best-effort: a publish still succeeds even if this notify fails —
+// the operator can re-publish. project = the tenant slug; url = the deployed
+// workers.dev URL (jg-api derives the worker name from it).
+async function notifyWebPodPublished(project, url) {
+  const base = apiBase();
+  if (!base) throw new Error('no jg-api endpoint to register web pod publish');
+  const res = await fetch(`${base}/api/local/web-pod/published`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
+    body: JSON.stringify({ project, url, relay: RELAY_ID }),
+  });
+  if (!res.ok) throw new Error(`web-pod publish register failed (${res.status})`);
+  return res.json();
+}
+
 // Ask jg-api to provision a NAMED jaagaa.ai preview tunnel for ONE app. jg-api
 // owns the CF API; we only receive a run token scoped to this single tunnel
 // (ingress remotely-managed: this app's host → our localhost:<port>, nothing
@@ -381,24 +398,25 @@ export function makeEditorCommands({ ws, version }) {
       await run('git', ['-C', workspace, 'commit', '-m', msg]).catch((e) => ctx.logLine('git', e.stderr || 'nothing to commit'));
       const branch = (await run('git', ['-C', workspace, 'rev-parse', '--abbrev-ref', 'HEAD']).then((r) => r.stdout.trim()).catch(() => 'main')) || 'main';
       const project = path.basename(workspace);
-      // Prefer a per-project, repo-scoped token from jg-api (no broad owner creds).
-      // But Local mode runs on the OWNER's own machine against the OWNER's own repo,
-      // so if jg-api can't mint that token (App not configured / repo not in the
-      // installation), fall back to a plain push to `origin` using the user's own
-      // git credential (keychain / gh) — exactly what worked before this path was
-      // switched to App-only in v0.4.1. Graceful degradation: push always works.
-      let stdout = '', stderr = '', via = 'scoped-token';
+      // Push ONLY with a per-project, repo-scoped token minted by jg-api — the
+      // SAME source the sandbox uses (jg-api getCloneUrl → JG_REPO_TOKEN). No
+      // owner credentials, ever: local and sandbox behave identically. The token
+      // is used transiently via http.extraheader so it's never persisted to
+      // .git/config; `origin` on disk stays a tokenless URL. If jg-api can't mint
+      // the token, the push fails with a clear error (don't silently fall back to
+      // the owner's git credential — that would mask a real auth/config gap).
+      const scopedUrl = await mintCloneUrl(project); // throws → surfaced to console
+      const tok = (scopedUrl.match(/\/\/x-access-token:([^@]+)@/) || [])[1] || '';
+      const authArgs = tok ? ['-c', `http.extraheader=Authorization: Basic ${Buffer.from(`x-access-token:${tok}`).toString('base64')}`] : [];
+      let stdout = '', stderr = '';
       try {
-        const scopedUrl = await mintCloneUrl(project);
-        ({ stdout, stderr } = await run('git', ['-C', workspace, 'push', scopedUrl, `HEAD:${branch}`], { timeout: 180_000 }));
+        ({ stdout, stderr } = await run('git', ['-C', workspace, ...authArgs, 'push', 'origin', `HEAD:${branch}`], { timeout: 180_000 }));
       } catch (e) {
-        via = 'origin';
-        ctx.logLine('git', `repo-scoped token unavailable (${(e && e.message) || e}); pushing to origin with local git credentials`);
-        ({ stdout, stderr } = await run('git', ['-C', workspace, 'push', 'origin', `HEAD:${branch}`], { timeout: 180_000 }));
+        throw new Error(`push failed: ${String((e && (e.stderr || e.message)) || e).replace(/x-access-token:[^@]+@/g, 'x-access-token:***@').slice(0, 400)}`);
       }
       const head = await run('git', ['-C', workspace, 'rev-parse', '--short', 'HEAD']).then((r) => r.stdout.trim()).catch(() => null);
       // Return the fields the console reads (pushed/head/branch) so it reports success.
-      return { ok: true, pushed: true, head, branch, via, output: (stdout + stderr).trim().slice(0, 1000) };
+      return { ok: true, pushed: true, head, branch, via: 'scoped-token', output: (stdout + stderr).trim().slice(0, 1000) };
     },
 
     // --- preview (local dev server + cloudflared tunnel) ------------------
@@ -580,6 +598,23 @@ export function makeEditorCommands({ ws, version }) {
       const { stdout, stderr } = await run('npx', ['wrangler', 'deploy'], { cwd, timeout: 600_000 });
       const out = stdout + stderr;
       const url = (out.match(/https:\/\/[^\s]+\.workers\.dev[^\s]*/i) || [])[0] || null;
+      // If this is the tenant's `web` MARKETING pod, tell jg-api so the core
+      // worker binds POD_WEB and serves the homepage from the pod (not the baked
+      // template). Detected from the pod's jaagaa.app.json tech, so it's generic
+      // — no hardcoded app names. Best-effort: never fails the publish.
+      let marketing = false;
+      try {
+        const m = JSON.parse(await readFile(path.join(cwd, 'jaagaa.app.json'), 'utf8'));
+        marketing = String(m?.tech || '').toLowerCase() === 'marketing';
+      } catch { /* no manifest / not marketing */ }
+      if (marketing && url) {
+        try {
+          await notifyWebPodPublished(path.basename(workspace), url);
+          ctx.logLine('deploy', 'homepage now served from this pod (POD_WEB bound)');
+        } catch (e) {
+          ctx.logLine('deploy', `published, but registering as live homepage failed: ${(e && e.message) || e}`);
+        }
+      }
       return { ok: true, url, output: out.slice(-2000) };
     },
 
