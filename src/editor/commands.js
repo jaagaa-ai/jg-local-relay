@@ -380,11 +380,25 @@ export function makeEditorCommands({ ws, version }) {
       await run('git', ['-C', workspace, 'add', '-A']);
       await run('git', ['-C', workspace, 'commit', '-m', msg]).catch((e) => ctx.logLine('git', e.stderr || 'nothing to commit'));
       const branch = (await run('git', ['-C', workspace, 'rev-parse', '--abbrev-ref', 'HEAD']).then((r) => r.stdout.trim()).catch(() => 'main')) || 'main';
-      // Push via a fresh scoped token URL inline — never persisted in git config.
       const project = path.basename(workspace);
-      const scopedUrl = await mintCloneUrl(project);
-      const { stdout, stderr } = await run('git', ['-C', workspace, 'push', scopedUrl, `HEAD:${branch}`], { timeout: 180_000 });
-      return { ok: true, output: (stdout + stderr).trim().slice(0, 1000) };
+      // Prefer a per-project, repo-scoped token from jg-api (no broad owner creds).
+      // But Local mode runs on the OWNER's own machine against the OWNER's own repo,
+      // so if jg-api can't mint that token (App not configured / repo not in the
+      // installation), fall back to a plain push to `origin` using the user's own
+      // git credential (keychain / gh) — exactly what worked before this path was
+      // switched to App-only in v0.4.1. Graceful degradation: push always works.
+      let stdout = '', stderr = '', via = 'scoped-token';
+      try {
+        const scopedUrl = await mintCloneUrl(project);
+        ({ stdout, stderr } = await run('git', ['-C', workspace, 'push', scopedUrl, `HEAD:${branch}`], { timeout: 180_000 }));
+      } catch (e) {
+        via = 'origin';
+        ctx.logLine('git', `repo-scoped token unavailable (${(e && e.message) || e}); pushing to origin with local git credentials`);
+        ({ stdout, stderr } = await run('git', ['-C', workspace, 'push', 'origin', `HEAD:${branch}`], { timeout: 180_000 }));
+      }
+      const head = await run('git', ['-C', workspace, 'rev-parse', '--short', 'HEAD']).then((r) => r.stdout.trim()).catch(() => null);
+      // Return the fields the console reads (pushed/head/branch) so it reports success.
+      return { ok: true, pushed: true, head, branch, via, output: (stdout + stderr).trim().slice(0, 1000) };
     },
 
     // --- preview (local dev server + cloudflared tunnel) ------------------
