@@ -156,6 +156,29 @@ async function mintCloneUrl(project) {
 }
 const stripToken = (url) => url.replace(/\/\/[^@/]+@/, '//'); // token-free remote
 
+// Cloudflare credentials for `wrangler deploy`, minted per project by jg-api the
+// same way the repo token is. Held only in the spawn env for one command — never
+// written to .env, wrangler's config, or the shell profile.
+async function mintDeployEnv(project) {
+  const base = apiBase();
+  if (!base) throw new Error('no jg-api endpoint to mint deploy credentials');
+  const res = await fetch(`${base}/api/local/deploy-creds`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
+    body: JSON.stringify({ project, relay: RELAY_ID }),
+  });
+  if (!res.ok) {
+    let msg = `deploy credentials unavailable (${res.status})`;
+    try { const j = await res.json(); if (j && j.message) msg = j.message; } catch { /* non-JSON */ }
+    throw new Error(msg);
+  }
+  const j = await res.json();
+  if (!j.token) throw new Error('deploy credentials: no token');
+  const env = { CLOUDFLARE_API_TOKEN: j.token };
+  if (j.accountId) env.CLOUDFLARE_ACCOUNT_ID = j.accountId;
+  return env;
+}
+
 // Tell jg-api the tenant's `web` marketing pod was just published so it binds
 // POD_WEB on the core worker and serves marketing from the pod (not the baked
 // template). Best-effort: a publish still succeeds even if this notify fails —
@@ -594,8 +617,14 @@ export function makeEditorCommands({ ws, version }) {
     },
     'site.deploy': async (args, ctx) => {
       const cwd = args.app ? resolveIn(args.app) : workspace;
+      // wrangler is non-interactive here, so it needs CLOUDFLARE_API_TOKEN in the
+      // environment or it exits telling the user to create one by hand. Mint the
+      // project's own credential per deploy and pass it for this command only.
+      const cfEnv = await mintDeployEnv(path.basename(workspace));
       ctx.logLine('deploy', 'wrangler deploy…');
-      const { stdout, stderr } = await run('npx', ['wrangler', 'deploy'], { cwd, timeout: 600_000 });
+      const { stdout, stderr } = await run('npx', ['wrangler', 'deploy'], {
+        cwd, timeout: 600_000, env: { ...process.env, ...cfEnv },
+      });
       const out = stdout + stderr;
       const url = (out.match(/https:\/\/[^\s]+\.workers\.dev[^\s]*/i) || [])[0] || null;
       // If this is the tenant's `web` MARKETING pod, tell jg-api so the core
