@@ -280,6 +280,16 @@ export function makeEditorCommands({ ws, version }) {
       const project = String(args.project || args.slug || '').trim();
       if (!project) throw new Error('local.setup requires { project }');
       const dest = args.path ? path.resolve(args.path) : path.join(LOCAL_ROOT, project);
+      // args.path was resolved with no containment, so a caller could clone —
+      // and later run npm install + the coding agent — anywhere on the machine.
+      // Only the project owner's own browser can send it, so this was never a
+      // cross-tenant hole; it's that a stray or malformed path shouldn't be able
+      // to write outside the workspace root at all. Set JG_LOCAL_ROOT to move
+      // the root deliberately; that stays the one supported way.
+      const rel = path.relative(LOCAL_ROOT, dest);
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+        throw new Error(`refusing to use a workspace outside ${LOCAL_ROOT}`);
+      }
       const branch = args.branch || 'main';
       await mkdir(path.dirname(dest), { recursive: true });
       // Repo auth = a short-lived, single-repo-scoped token minted by jg-api
