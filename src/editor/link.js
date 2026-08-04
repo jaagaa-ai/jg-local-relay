@@ -48,8 +48,11 @@ export function startEditorLink({ version }) {
   // project tabs driving the same relay can never see each other's workspace or
   // dev server. Routed by the command's `args.project`.
   let editors = new Map(); // project -> { table, dispose }
-  const editorFor = (project) => {
-    const key = String(project || '__default__');
+  const editorFor = (account, project) => {
+    // Keyed by account AND project: the same project opened by two accounts on
+    // one machine gets two sessions with two workspaces, so neither inherits the
+    // other's uncommitted work, checked-out branch or dev server.
+    const key = `${String(account || '__noacct__')}::${String(project || '__default__')}`;
     let e = editors.get(key);
     if (!e) { e = makeEditorCommands({ ws, version }); editors.set(key, e); log(`spawned editor session for project "${key}"`); }
     return e;
@@ -80,8 +83,15 @@ export function startEditorLink({ version }) {
     ws.on('message', (raw) => {
       let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === 'ping') return send(ws, { type: 'pong', ts: Date.now() });
-      // Route to the per-project editor session (isolated workspace + processes).
-      if (msg.type === 'command') return void runCommand(ws, editorFor(msg.args?.project).table, msg);
+      // Route to the per-account, per-project editor session (isolated workspace
+      // + processes). `account` is stamped by the hub from the proven session —
+      // never sent by the browser — and is passed down in args so the command
+      // table can put each account's checkout under its own root.
+      if (msg.type === 'command') {
+        const account = String(msg.account || '');
+        const withAccount = { ...msg, args: { ...(msg.args || {}), account } };
+        return void runCommand(ws, editorFor(account, msg.args?.project).table, withAccount);
+      }
     });
 
     ws.on('close', () => {

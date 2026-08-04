@@ -17,6 +17,16 @@ import { existsSync } from 'node:fs';
 import { Terminal } from './terminal.js';
 
 const LOCAL_ROOT = process.env.JG_LOCAL_ROOT || path.join(os.homedir(), 'Documents', 'Jaagaa-ai');
+// Each Jaagaa account gets its own checkout tree: <root>/<account>/<project>.
+// One shared tree meant a second account on the same machine inherited the
+// first's uncommitted edits, branch and build state — local.setup only fetches,
+// it never checks out — so work could be committed under the wrong name. The
+// account is stamped by the hub from the proven session, not by the browser.
+// Falls back to the flat layout when no account is present (older hub).
+const accountRoot = (account) => {
+  const safe = String(account || '').toLowerCase().replace(/[^a-z0-9._@-]/g, '_');
+  return safe ? path.join(LOCAL_ROOT, safe) : LOCAL_ROOT;
+};
 
 // This relay's stable id — same value sent in the dial-home hello frame, so
 // jg-api can correlate a resource-mint REST call to the live bridged session and
@@ -279,16 +289,17 @@ export function makeEditorCommands({ ws, version }) {
     'local.setup': async (args, ctx) => {
       const project = String(args.project || args.slug || '').trim();
       if (!project) throw new Error('local.setup requires { project }');
-      const dest = args.path ? path.resolve(args.path) : path.join(LOCAL_ROOT, project);
+      const root = accountRoot(args.account);
+      const dest = args.path ? path.resolve(args.path) : path.join(root, project);
       // args.path was resolved with no containment, so a caller could clone —
       // and later run npm install + the coding agent — anywhere on the machine.
       // Only the project owner's own browser can send it, so this was never a
       // cross-tenant hole; it's that a stray or malformed path shouldn't be able
       // to write outside the workspace root at all. Set JG_LOCAL_ROOT to move
       // the root deliberately; that stays the one supported way.
-      const rel = path.relative(LOCAL_ROOT, dest);
+      const rel = path.relative(root, dest);
       if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
-        throw new Error(`refusing to use a workspace outside ${LOCAL_ROOT}`);
+        throw new Error(`refusing to use a workspace outside ${root}`);
       }
       const branch = args.branch || 'main';
       await mkdir(path.dirname(dest), { recursive: true });
