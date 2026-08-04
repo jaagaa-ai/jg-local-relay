@@ -14,6 +14,9 @@
 
 import WebSocket from 'ws';
 import os from 'node:os';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { makeEditorCommands } from './commands.js';
 import { runCommand, send } from './protocol.js';
 
@@ -39,6 +42,24 @@ export function startEditorLink({ version }) {
   const token = process.env.JG_RELAY_TOKEN || '';
   const relayId = process.env.JG_RELAY_ID || os.hostname();
   const log = (...a) => console.log(new Date().toISOString(), '[editor]', ...a);
+  // Accounts allowed to drive THIS machine's relay, beyond the one that claims
+  // it first. Declared here rather than server-side on purpose: driving a relay
+  // means running commands on this machine, so the authority to grant that
+  // belongs to whoever holds the machine — not to anyone who can reach the API.
+  // One email per line in allowed-accounts.txt (# comments ok), or JG_RELAY_ALLOW.
+  const readAllowList = () => {
+    const out = new Set();
+    for (const e of (process.env.JG_RELAY_ALLOW || '').split(',')) {
+      const v = e.trim().toLowerCase(); if (v) out.add(v);
+    }
+    try {
+      const f = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'allowed-accounts.txt');
+      for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+        const v = line.split('#')[0].trim().toLowerCase(); if (v) out.add(v);
+      }
+    } catch { /* no file → env only */ }
+    return [...out];
+  };
 
   let ws = null;
   let backoff = 1_000;
@@ -69,8 +90,11 @@ export function startEditorLink({ version }) {
     ws.on('open', () => {
       backoff = 1_000;
       alive = true;
-      send(ws, { type: 'hello', token, relay: { id: relayId, host: os.hostname(), user: os.userInfo().username, platform: process.platform, version, surface: 'editor' } });
-      log('connected; sent hello (surface=editor)');
+      // Re-read the allow list on every (re)connect, so editing the file and
+      // restarting nothing but the socket is enough to grant or revoke.
+      const allow = readAllowList();
+      send(ws, { type: 'hello', token, relay: { id: relayId, host: os.hostname(), user: os.userInfo().username, platform: process.platform, version, surface: 'editor', allow } });
+      log(`connected; sent hello (surface=editor${allow.length ? `, ${allow.length} allowed account(s)` : ''})`);
       clearInterval(heartbeat);
       // ws-level ping; terminate if jg-api misses a pong (half-open after a
       // redeploy) so the 'close' handler reconnects instead of sitting dead.

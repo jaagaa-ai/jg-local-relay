@@ -1,0 +1,17 @@
+# Jaagaa accounts allowed to drive THIS machine's relay, in addition to the
+# account that claims it first.
+#
+# Driving a relay runs commands on this machine — git, npm, wrangler, the coding
+# agent — as this Unix user, with this user's files. So the grant lives here, on
+# the machine, rather than anywhere it could be made remotely: whoever holds the
+# hardware decides. jg-api only enforces what this file declares.
+#
+# One email per line; blank lines and # comments ignored. Re-read on every
+# reconnect, so editing this file and restarting the relay is enough to grant or
+# revoke. JG_RELAY_ALLOW=a@x.com,b@y.com works too.
+#
+# Copy to allowed-accounts.txt and add emails. Each account gets its OWN
+# workspace tree at ~/Documents/Jaagaa-ai/<account>/<project>, so sessions run in
+# parallel without sharing a checkout.
+
+# you@example.com
