@@ -191,7 +191,16 @@ restoreOwnedTunnels()
   })
   .catch((e) => log(`[tunnel] boot restore error: ${e.message}`));
 
-connect();
+// A machine enrolled for the AI Editor holds a per-account token (jgr_…), which
+// the control plane does not accept — it only knows the shared operator secret.
+// Dialling it anyway produced an endless 401 reconnect loop, showing up as a
+// flapping status dot on a link the editor never uses. The editor link started
+// above is what this machine is enrolled for.
+if (/^jgr_/.test(TOKEN)) {
+  log('editor-only relay (per-account token) — not dialling the control plane');
+} else {
+  connect();
+}
 
 // AI-Editor surface (additive, gated by JG_API_WS_URL). A second outbound WSS
 // to jg-api for the Local Editor; no-op when the env var is unset, so the
