@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { commands, adoptOrphanTunnels, restoreOwnedTunnels } from './commands.js';
 import { startEditorLink } from './editor/link.js';
+import { startSelfUpdate } from './self-update.js';
 
 // Last-resort guards — even one un-caught spawn error has killed the relay
 // hard enough that launchd takes ~8s to bring us back. During that window cp
@@ -196,3 +197,5 @@ connect();
 // to jg-api for the Local Editor; no-op when the env var is unset, so the
 // control-plane behavior above is completely unaffected. See src/editor/.
 try { startEditorLink({ version: VERSION }); } catch (e) { log('[editor] start failed (non-fatal):', e.message); }
+// Keep this machine on the current build without anyone copying files onto it.
+try { startSelfUpdate(); } catch (e) { log('[update] start failed (non-fatal):', e.message); }
