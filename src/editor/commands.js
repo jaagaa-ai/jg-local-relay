@@ -439,7 +439,15 @@ export function makeEditorCommands({ ws, version }) {
     'repo.push': async (args, ctx) => {
       const msg = args.message || 'Update from Jaagaa Local Editor';
       await run('git', ['-C', workspace, 'add', '-A']);
-      await run('git', ['-C', workspace, 'commit', '-m', msg]).catch((e) => ctx.logLine('git', e.stderr || 'nothing to commit'));
+      // Attribute the commit to the Jaagaa account that made it. The commit used
+      // to take whatever git identity happened to be configured on the machine,
+      // so on a shared or newly set up laptop every developer's work landed under
+      // one name — or none, and the commit failed outright. `account` is stamped
+      // by the hub from the proven session, so history answers "who pushed this"
+      // with the person the platform authenticated, not a local config file.
+      const acct = String(args.account || '').trim();
+      const ident = acct ? ['-c', `user.name=${acct.split('@')[0]}`, '-c', `user.email=${acct}`] : [];
+      await run('git', ['-C', workspace, ...ident, 'commit', '-m', msg]).catch((e) => ctx.logLine('git', e.stderr || 'nothing to commit'));
       const branch = (await run('git', ['-C', workspace, 'rev-parse', '--abbrev-ref', 'HEAD']).then((r) => r.stdout.trim()).catch(() => 'main')) || 'main';
       const project = path.basename(workspace);
       // Push ONLY with a per-project, repo-scoped token minted by jg-api — the
