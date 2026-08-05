@@ -47,18 +47,28 @@ export function startEditorLink({ version }) {
   // means running commands on this machine, so the authority to grant that
   // belongs to whoever holds the machine — not to anyone who can reach the API.
   // One email per line in allowed-accounts.txt (# comments ok), or JG_RELAY_ALLOW.
-  const readAllowList = () => {
-    const out = new Set();
+  // `owner=<email>` names the account this machine belongs to; bare lines are
+  // additional accounts. The owner MUST be declared here rather than inferred
+  // from whoever connects first: an allowed second account connecting before the
+  // owner left the relay unclaimed, and the next account to arrive claimed it —
+  // which locked the actual owner out of their own machine.
+  const readAccounts = () => {
+    const allow = new Set();
+    let owner = (process.env.JG_RELAY_OWNER || '').trim().toLowerCase() || null;
     for (const e of (process.env.JG_RELAY_ALLOW || '').split(',')) {
-      const v = e.trim().toLowerCase(); if (v) out.add(v);
+      const v = e.trim().toLowerCase(); if (v) allow.add(v);
     }
     try {
       const f = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'allowed-accounts.txt');
       for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
-        const v = line.split('#')[0].trim().toLowerCase(); if (v) out.add(v);
+        const v = line.split('#')[0].trim().toLowerCase();
+        if (!v) continue;
+        const m = v.match(/^owner\s*[=:]\s*(.+)$/);
+        if (m) { owner = m[1].trim(); continue; }
+        allow.add(v);
       }
     } catch { /* no file → env only */ }
-    return [...out];
+    return { owner, allow: [...allow] };
   };
 
   let ws = null;
@@ -92,9 +102,9 @@ export function startEditorLink({ version }) {
       alive = true;
       // Re-read the allow list on every (re)connect, so editing the file and
       // restarting nothing but the socket is enough to grant or revoke.
-      const allow = readAllowList();
-      send(ws, { type: 'hello', token, relay: { id: relayId, host: os.hostname(), user: os.userInfo().username, platform: process.platform, version, surface: 'editor', allow } });
-      log(`connected; sent hello (surface=editor${allow.length ? `, ${allow.length} allowed account(s)` : ''})`);
+      const { owner, allow } = readAccounts();
+      send(ws, { type: 'hello', token, relay: { id: relayId, host: os.hostname(), user: os.userInfo().username, platform: process.platform, version, surface: 'editor', owner, allow } });
+      log(`connected; sent hello (surface=editor${owner ? `, owner=${owner}` : ''}${allow.length ? `, ${allow.length} allowed` : ''})`);
       clearInterval(heartbeat);
       // ws-level ping; terminate if jg-api misses a pong (half-open after a
       // redeploy) so the 'close' handler reconnects instead of sitting dead.
