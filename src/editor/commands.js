@@ -13,7 +13,8 @@ import path from 'node:path';
 import http from 'node:http';
 import { spawn, execFile } from 'node:child_process';
 import { mkdir, readdir, readFile, writeFile, stat } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { Terminal } from './terminal.js';
 
 const LOCAL_ROOT = process.env.JG_LOCAL_ROOT || path.join(os.homedir(), 'Documents', 'Jaagaa-ai');
@@ -32,6 +33,9 @@ const accountRoot = (account) => {
 // jg-api can correlate a resource-mint REST call to the live bridged session and
 // refuse minting another account's project (account-isolation backstop).
 const RELAY_ID = process.env.JG_RELAY_ID || os.hostname();
+// Where the relay itself is installed (…/src/editor/commands.js → …/). The build
+// stamp self-update writes lives here.
+const INSTALL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
   execFile(cmd, args, { timeout: 120_000, maxBuffer: 16 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
@@ -326,7 +330,15 @@ export function makeEditorCommands({ ws, version }) {
       }
       return { ok: true, project, workspace, action };
     },
-    'session.info': async () => ({ workspace, root: LOCAL_ROOT, terms: terms.size, procs: [...procs.keys()], version: version ?? null, platform: process.platform, host: os.hostname(), logPath: RELAY_LOG }),
+    'session.info': async () => ({
+      workspace, root: LOCAL_ROOT, terms: terms.size, procs: [...procs.keys()],
+      version: version ?? null, platform: process.platform, host: os.hostname(), logPath: RELAY_LOG,
+      // The BUILD, not package.json's version — that string never moves, so a
+      // five-week-old relay reported the same "v0.4.12" as a current one and
+      // nothing on screen could tell them apart.
+      distSha: (() => { try { return readFileSync(path.join(INSTALL_ROOT, '.dist-sha'), 'utf8').trim(); } catch { return null; } })(),
+      selfUpdate: !process.env.JG_RELAY_NO_SELF_UPDATE,
+    }),
 
     // --- local host actions (Local mode only) -----------------------------
     // Reveal a folder/file in the OS file manager (Finder / Explorer / xdg).
