@@ -472,6 +472,25 @@ export function makeEditorCommands({ ws, version }) {
       const scopedUrl = await mintCloneUrl(project); // throws → surfaced to console
       const tok = (scopedUrl.match(/\/\/x-access-token:([^@]+)@/) || [])[1] || '';
       const authArgs = tok ? ['-c', `http.extraheader=Authorization: Basic ${Buffer.from(`x-access-token:${tok}`).toString('base64')}`] : [];
+      // Catch up on what other people pushed BEFORE pushing. local.setup only
+      // fetches — it never merges — so a second developer's checkout drifts
+      // behind the moment anyone else pushes, and their next push is rejected
+      // non-fast-forward with git's "use 'git pull'" hint, which they cannot act
+      // on from the editor. Rebase our commit onto the remote tip instead.
+      await run('git', ['-C', workspace, ...authArgs, 'fetch', '--quiet', 'origin', branch], { timeout: 300_000 }).catch(() => {});
+      const behind = await run('git', ['-C', workspace, 'rev-list', '--count', `HEAD..origin/${branch}`])
+        .then((r) => Number(r.stdout.trim()) || 0).catch(() => 0);
+      if (behind > 0) {
+        ctx.logLine('git', `${behind} new commit(s) on origin/${branch} — rebasing before push`);
+        try {
+          await run('git', ['-C', workspace, ...ident, '-c', 'rebase.autoStash=true', 'rebase', `origin/${branch}`], { timeout: 300_000 });
+        } catch (e) {
+          // Leave the tree as git left it and say what to do; silently aborting
+          // would hide a real conflict behind a generic push failure.
+          await run('git', ['-C', workspace, 'rebase', '--abort']).catch(() => {});
+          throw new Error(`push stopped: your copy is ${behind} commit(s) behind and the changes conflict. Resolve in ${workspace}, then push again. ${String((e && (e.stderr || e.message)) || '').slice(0, 200)}`);
+        }
+      }
       let stdout = '', stderr = '';
       try {
         ({ stdout, stderr } = await run('git', ['-C', workspace, ...authArgs, 'push', 'origin', `HEAD:${branch}`], { timeout: 180_000 }));
