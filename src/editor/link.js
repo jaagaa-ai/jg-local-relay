@@ -19,6 +19,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeEditorCommands } from './commands.js';
 import { runCommand, send } from './protocol.js';
+import { checkForUpdateNow } from '../self-update.js';
 
 const HEARTBEAT_MS = 25_000;
 const MAX_BACKOFF_MS = 30_000;
@@ -105,6 +106,9 @@ export function startEditorLink({ version }) {
       const { owner, allow } = readAccounts();
       send(ws, { type: 'hello', token, relay: { id: relayId, host: os.hostname(), user: os.userInfo().username, platform: process.platform, version, surface: 'editor', owner, allow } });
       log(`connected; sent hello (surface=editor${owner ? `, owner=${owner}` : ''}${allow.length ? `, ${allow.length} allowed` : ''})`);
+      // We know the platform is reachable right now — cheapest moment to notice
+      // a new build, and far better than waiting out an hourly timer.
+      void checkForUpdateNow('editor connect');
       clearInterval(heartbeat);
       // ws-level ping; terminate if jg-api misses a pong (half-open after a
       // redeploy) so the 'close' handler reconnects instead of sitting dead.

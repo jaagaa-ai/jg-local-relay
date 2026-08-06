@@ -96,10 +96,28 @@ async function checkOnce() {
   }
 }
 
+// Ask now, not on the next tick of a timer. The editor link reconnects often
+// (redeploys, sleep/wake, network blips), and each one is a moment we already
+// know the platform is reachable — so it is the cheapest possible moment to
+// notice a new build. Waiting an hour meant a machine installed minutes before
+// a fix kept running the broken code, with the person watching the same error
+// and no way to tell that the fix already existed.
+let lastCheck = 0;
+export async function checkForUpdateNow(reason = 'reconnect') {
+  if (process.env.JG_RELAY_NO_SELF_UPDATE) return;
+  // Don't re-check on a flapping connection; a reconnect storm shouldn't turn
+  // into a download storm.
+  if (Date.now() - lastCheck < 120_000) return;
+  lastCheck = Date.now();
+  log(`checking for updates (${reason})`);
+  await checkOnce();
+}
+
 export function startSelfUpdate() {
   if (process.env.JG_RELAY_NO_SELF_UPDATE) { log('self-update disabled'); return; }
   // A few seconds after boot, then hourly. The delay keeps an update from
   // racing the relay's own startup on a machine that just came back.
-  setTimeout(() => { void checkOnce(); }, 15_000).unref?.();
-  setInterval(() => { void checkOnce(); }, 60 * 60_000).unref?.();
+  setTimeout(() => { lastCheck = Date.now(); void checkOnce(); }, 15_000).unref?.();
+  // Hourly is now just the backstop for a relay that never reconnects.
+  setInterval(() => { lastCheck = Date.now(); void checkOnce(); }, 60 * 60_000).unref?.();
 }
