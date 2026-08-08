@@ -450,6 +450,27 @@ export function makeEditorCommands({ ws, version }) {
     },
     'repo.push': async (args, ctx) => {
       const msg = args.message || 'Update from Jaagaa Local Editor';
+      // An interrupted rebase or merge — left by an earlier conflicted push, or
+      // by the relay restarting mid-rebase — blocks EVERY later git operation,
+      // including the commit a few lines down. The person then hits Push, gets a
+      // different and more confusing error each time, and has no way to clear it:
+      // the fix is a git incantation and the editor is not a terminal. Clear it
+      // here, before anything else touches the tree.
+      const gitDir = await run('git', ['-C', workspace, 'rev-parse', '--git-dir'])
+        .then((r) => path.resolve(workspace, r.stdout.trim())).catch(() => null);
+      if (gitDir) {
+        if (existsSync(path.join(gitDir, 'rebase-merge')) || existsSync(path.join(gitDir, 'rebase-apply'))) {
+          ctx.logLine('git', 'clearing an interrupted rebase left by an earlier push');
+          await run('git', ['-C', workspace, 'rebase', '--abort']).catch(() => {});
+        }
+        if (existsSync(path.join(gitDir, 'MERGE_HEAD'))) {
+          ctx.logLine('git', 'clearing an interrupted merge left by an earlier push');
+          await run('git', ['-C', workspace, 'merge', '--abort']).catch(() => {});
+        }
+        if (existsSync(path.join(gitDir, 'CHERRY_PICK_HEAD'))) {
+          await run('git', ['-C', workspace, 'cherry-pick', '--abort']).catch(() => {});
+        }
+      }
       await run('git', ['-C', workspace, 'add', '-A']);
       // Attribute the commit to the Jaagaa account that made it. The commit used
       // to take whatever git identity happened to be configured on the machine,
@@ -485,10 +506,40 @@ export function makeEditorCommands({ ws, version }) {
         try {
           await run('git', ['-C', workspace, ...ident, '-c', 'rebase.autoStash=true', 'rebase', `origin/${branch}`], { timeout: 300_000 });
         } catch (e) {
-          // Leave the tree as git left it and say what to do; silently aborting
-          // would hide a real conflict behind a generic push failure.
+          const detail = String((e && (e.stderr || e.message)) || '')
+            .replace(/x-access-token:[^@]+@/g, 'x-access-token:***@').slice(0, 200);
+          // Put the tree back exactly as it was. A half-finished rebase makes
+          // every later action fail, so leaving it "as git left it" strands the
+          // workspace rather than informing anyone.
           await run('git', ['-C', workspace, 'rebase', '--abort']).catch(() => {});
-          throw new Error(`push stopped: your copy is ${behind} commit(s) behind and the changes conflict. Resolve in ${workspace}, then push again. ${String((e && (e.stderr || e.message)) || '').slice(0, 200)}`);
+          // The work still has to go SOMEWHERE. Telling someone to resolve
+          // conflicts by hand in a directory they reached through a web editor
+          // is not a fix — it is the end of the road for anyone who doesn't
+          // drive git directly. Park the commits on a branch of their own so
+          // they are safely on the remote and reviewable, and the only thing
+          // left is a merge someone can do in the GitHub UI.
+          const who = (acct.split('@')[0] || 'local').replace(/[^A-Za-z0-9._-]/g, '-');
+          const stamp = new Date().toISOString().replace(/[:-]/g, '').replace(/\..+$/, '');
+          const rescue = `jaagaa/${who}/${stamp}`;
+          let parked = null;
+          try {
+            await run('git', ['-C', workspace, ...authArgs, 'push', 'origin', `HEAD:refs/heads/${rescue}`], { timeout: 180_000 });
+            parked = rescue;
+          } catch { /* remote refused it too — fall through to the plain message */ }
+          if (parked) {
+            const web = await run('git', ['-C', workspace, 'remote', 'get-url', 'origin'])
+              .then((r) => r.stdout.trim().replace(/^git@github\.com:/, 'https://github.com/').replace(/\.git$/, ''))
+              .catch(() => null);
+            const link = web ? ` Open a pull request: ${web}/compare/${branch}...${encodeURIComponent(parked)}` : '';
+            const err = new Error(
+              `Your changes conflict with ${behind} new commit(s) on ${branch}, so they could not be replayed on top. `
+              + `Nothing was lost — your work is pushed to the branch "${parked}".${link} `
+              + `Your local copy is untouched and back the way it was.`,
+            );
+            err.parkedBranch = parked;
+            throw err;
+          }
+          throw new Error(`push stopped: your copy is ${behind} commit(s) behind and the changes conflict. Resolve in ${workspace}, then push again. ${detail}`);
         }
       }
       let stdout = '', stderr = '';
