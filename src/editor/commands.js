@@ -464,7 +464,19 @@ export function makeEditorCommands({ ws, version }) {
        * subject. Better to wait, and to say so if it never arrives. */
       for (let i = 0; i < 100 && !workspace; i++) await new Promise((r) => setTimeout(r, 100));
       if (!workspace) throw new Error('no workspace yet — the project is still being prepared, try again in a moment');
-      const t = new Terminal({ ws, id: ctx.id, cwd: workspace });
+      /* A POD'S TERMINAL OPENS IN THAT POD.
+       *
+       * Every terminal used to open at the repo root, so switching pod tabs
+       * showed the same shell in the same directory — `vault` selected and the
+       * prompt sitting in the project root. agent.chat has always resolved the
+       * pod (`cwd = app ? resolveIn(app) : workspace`); the terminal did not,
+       * so Chat and Terminal disagreed about what "this pod" meant.
+       *
+       * `path` is optional: an older console sends nothing and still gets the
+       * root, which is also the honest answer when no pod is named. */
+      const rel = typeof args?.path === 'string' ? args.path.trim() : '';
+      const cwd = rel ? resolveIn(rel) : workspace;
+      const t = new Terminal({ ws, id: ctx.id, cwd });
       t.open({ cols: args.cols, rows: args.rows });
       terms.set(ctx.id, t);
       return { opened: true, termId: ctx.id };
