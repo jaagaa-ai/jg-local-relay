@@ -227,6 +227,14 @@ async function provisionNamedTunnel(project, app, port) {
   if (!j.token || !j.host) throw new Error('preview-tunnel: missing token/host');
   return { tunnelId: j.tunnelId || null, token: j.token, host: j.host };
 }
+// A hostname is not a URL. jg-api hands back `host`; anything that reaches a
+// browser needs a scheme or it is interpreted relative to the current page.
+export function absUrl(host) {
+  const h = String(host || '').trim();
+  if (!h) return null;
+  return /^https?:\/\//i.test(h) ? h : `https://${h}`;
+}
+
 // The tenant Core origin a pod authenticates against (Identity Phase 2). Cached
 // per project; injected as CORE_URL into the dev server so lib/coreAuth.ts can
 // verify Core tokens against the Core JWKS.
@@ -677,14 +685,26 @@ export function makeEditorCommands({ ws, version }) {
         const cf = spawn('cloudflared', ['tunnel', '--no-autoupdate', 'run', '--token', prov.token], { env: process.env });
         cf.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l.trim()) emit('tunnel', l.trim()); });
         cf.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l.trim()) emit('tunnel', l.trim()); });
-        pv.tunnel = cf; pv.url = prov.host; pv.tunnelId = prov.tunnelId; pv.tunnelHost = prov.host;
-        emit('tunnel', `named preview tunnel: ${prov.host} (a few seconds to route)`);
+        // jg-api returns a bare HOSTNAME. It has to be stored as an absolute
+        // URL: the console puts this straight into <iframe src>, and a bare
+        // host is a RELATIVE url — the browser resolved it against the console
+        // origin and asked for
+        //   console.jaagaa.ai/projects/<slug>/jgc-<slug>-web-local.jaagaa.ai
+        // which 404s. The tunnel was healthy the whole time and the pane showed
+        // a broken page. The quick-tunnel fallback below never had this,
+        // because startTunnel() parses a full https:// url out of cloudflared.
+        pv.tunnel = cf; pv.url = absUrl(prov.host); pv.tunnelId = prov.tunnelId; pv.tunnelHost = prov.host;
+        emit('tunnel', `named preview tunnel: ${pv.url} (a few seconds to route)`);
       } catch (e) {
         emit('tunnel', `named tunnel unavailable (${e.message}); using a quick tunnel`);
         const { url, proc } = await startTunnel(tunnelPort, (l) => emit('tunnel', l));
         pv.tunnel = proc; pv.url = url;
       }
-      return { url };
+      // `url` was only ever declared inside the CATCH block, so on the named-
+      // tunnel path — the normal one — this line threw ReferenceError and
+      // preview.start reported failure over a dev server and tunnel that were
+      // both already up. Read it off pv, which both paths set.
+      return { url: pv.url };
     },
     'preview.restart': async (args, ctx) => { await table['preview.stop'](args); return table['preview.start'](args, ctx); },
     'preview.stop': async (args) => {
