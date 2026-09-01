@@ -360,14 +360,53 @@ export function makeEditorCommands({ ws, version }) {
   const chatStarted = new Set();   // conv/app keys with an ongoing thread (for --continue)
   const pickTerm = (id) => (id && terms.get(id)) || (terms.size === 1 ? [...terms.values()][0] : null);
 
+  /* WHICH PODS THIS ACCOUNT MAY TOUCH.
+   *
+   * Stamped by jg-api onto every command from the proven pair scope — the
+   * browser cannot name its own. Undefined means unrestricted (owner, operator,
+   * or a jg-api that predates this), which is the only safe default for an
+   * upgrade: a relay that updates before jg-api must not lock everybody out.
+   *
+   * A project is ONE repo with pods as folders, so without this a grant on one
+   * pod handed over every other pod's source, plus a terminal and an agent on
+   * top. project_members.grants has been per-pod since it shipped; nothing
+   * downstream had ever been told.
+   */
+  let allowedPods = null;                 // null = all
+  const setPods = (p) => { if (Array.isArray(p)) allowedPods = p.includes('*') ? null : p.map(String); };
+  /** Deny anything inside a pod this account was not granted.
+   *
+   *  The first path segment IS the pod, because pods are top-level folders.
+   *  Root-level files (README.md, .gitignore) belong to the project rather than
+   *  to any pod, so they stay readable — a member who cannot read the repo's
+   *  README learns nothing from being denied it, and Save has to see them. */
+  const requirePod = (rel) => {
+    if (!allowedPods) return;
+    const path0 = String(rel || '').replace(/^\/+/, '');
+    if (!path0) return;                                  // the workspace root
+    const first = path0.split('/')[0];
+    if (!path0.includes('/') && first.includes('.')) return;  // a root-level file
+    if (allowedPods.includes(first)) return;
+    throw new Error(`no access to "${first}" — you are granted: ${allowedPods.join(', ') || 'no pods'}`);
+  };
+
   // Resolve a path under the workspace; refuse traversal outside it.
   const resolveIn = (rel = '') => {
     if (!workspace) throw new Error('no workspace — call local.setup first');
     const abs = path.resolve(workspace, rel.replace(/^\/+/, ''));
     if (abs !== workspace && !abs.startsWith(workspace + path.sep)) throw new Error('path escapes workspace');
+    // The grant check lives HERE, with the containment check, because every
+    // path-taking command already funnels through this one function —
+    // fs.read/write/list, term.open, preview.start, site.build, site.deploy.
+    // Guarding each call site would mean remembering to guard the next one.
+    // Resolve first: `../vault/x` must be judged as `vault/x`, not as `..`.
+    requirePod(path.relative(workspace, abs));
     return abs;
   };
 
+  // Adopt the pods stamped on THIS command before it runs. Per command rather
+  // than once per session: a grant can be narrowed while somebody is connected,
+  // and the next command should feel it.
   const table = {
     // --- session / workspace ----------------------------------------------
     // Clone (or reuse) the project mono-repo locally + install deps, then make
@@ -954,5 +993,19 @@ export function makeEditorCommands({ ws, version }) {
     previews.clear();
   }
 
-  return { table, dispose };
+  /* Adopt the stamped grants before ANY command runs.
+   *
+   * Wrapped here rather than asked of each command, because the guard is only
+   * worth having if it cannot be forgotten — a new command added later is
+   * covered without its author knowing this exists.
+   *
+   * Per command, not once per session: a grant narrowed while somebody is
+   * connected takes effect on their next action rather than at their next
+   * sign-in. */
+  const guarded = Object.fromEntries(Object.entries(table).map(([name, fn]) => [
+    name,
+    (args, ctx) => { setPods(args?.pods); return fn(args, ctx); },
+  ]));
+
+  return { table: guarded, dispose };
 }

@@ -127,7 +127,10 @@ export function startEditorLink({ version }) {
       // table can put each account's checkout under its own root.
       if (msg.type === 'command') {
         const account = String(msg.account || '');
-        const withAccount = { ...msg, args: { ...(msg.args || {}), account } };
+        // `pods` is stamped by the hub from the proven pair scope, exactly like
+        // `account`. Absent = unrestricted (owner, operator, or an older
+        // jg-api that does not send it).
+        const withAccount = { ...msg, args: { ...(msg.args || {}), account, ...(Array.isArray(msg.pods) ? { pods: msg.pods } : {}) } };
         return void runCommand(ws, editorFor(account, msg.args?.project).table, withAccount);
       }
     });
