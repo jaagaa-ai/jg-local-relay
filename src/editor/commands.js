@@ -757,7 +757,7 @@ export function makeEditorCommands({ ws, version }) {
       child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('out', l); });
       child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('err', l); });
       child.on('exit', (code) => emit('out', `[dev server exited ${code}]`));
-      pv = { proc: child, tunnel: null, url: null, port: tunnelPort, tunnelId: null, tunnelHost: null, dataEnv, prodWrite };
+      pv = { proc: child, tunnel: null, url: null, port: tunnelPort, tunnelId: null, tunnelHost: null, dataEnv, prodWrite, publicOk: false };
       previews.set(app, pv);
       // Prefer a NAMED jaagaa.ai tunnel (jgc-<app>-<slug>-local.jaagaa.ai),
       // provisioned by jg-api + scoped to this one app. Fall back to a zero-
@@ -824,8 +824,40 @@ export function makeEditorCommands({ ws, version }) {
       // Probe THIS project's unique port (never a shared 8787), so a server from
       // another project can't make this pod look running.
       const port = pv?.port ?? stablePort(project, app);
-      const ready = port ? await probePort(port) : false;
-      const running = !!pv?.proc || ready;
+      const localUp = port ? await probePort(port) : false;
+      const running = !!pv?.proc || localUp;
+      /* READY MEANS THE BROWSER CAN LOAD IT, NOT THAT THE PORT ANSWERS.
+       *
+       * `ready` was a probe of the LOCAL port, which says nothing about whether
+       * the public hostname routes yet — and jg-api mints that DNS record at
+       * preview.start, seconds before it propagates ("a few seconds to route",
+       * as the tunnel line itself says).
+       *
+       * A dev server comes up fast, so ready went true immediately, the console
+       * put the URL in an iframe, and the browser asked for a name that did not
+       * exist yet. Browsers CACHE that miss: macOS mDNSResponder holds the
+       * negative answer, so every later load failed with "server IP address
+       * could not be found" while `dig` — which bypasses the system resolver —
+       * resolved it perfectly. One lost race poisons the name for its whole
+       * negative TTL, which is why it looked like the preview never worked
+       * rather than like a startup race.
+       *
+       * So the tunnel is probed too, and only its first success is cached: the
+       * expensive check stops once it passes, and a tunnel that dies later is
+       * still caught by the local probe and the console's own error handling. */
+      let ready = localUp;
+      if (localUp && pv?.url) {
+        if (pv.publicOk) ready = true;
+        else {
+          try {
+            const r = await fetch(pv.url, { method: 'HEAD', redirect: 'manual', signal: AbortSignal.timeout(4000) });
+            // Any HTTP answer proves DNS resolved and the tunnel routed. A 5xx
+            // from Cloudflare (1033 and friends) is not an answer from us.
+            pv.publicOk = r.status > 0 && r.status < 500;
+          } catch { pv.publicOk = false; }
+          ready = !!pv.publicOk;
+        }
+      }
       // Report the live data environment so the console can show the env badge
       // (Development / Production) + the read-only/write state.
       return { app, running, ready, url: pv?.url ?? null, port, dataEnv: pv?.dataEnv ?? null, prodWrite: pv?.prodWrite ?? false };
