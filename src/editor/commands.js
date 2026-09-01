@@ -234,17 +234,21 @@ const coreUrlCache = new Map();
 async function fetchCoreUrl(project) {
   if (coreUrlCache.has(project)) return coreUrlCache.get(project);
   const base = apiBase();
-  if (!base) return null;
+  if (!base) return { coreUrl: null, coreJwks: null };
   try {
     const res = await fetch(`${base}/api/local/core-url?project=${encodeURIComponent(project)}&relay=${encodeURIComponent(RELAY_ID)}`, {
       headers: { authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { coreUrl: null, coreJwks: null };
     const j = await res.json();
-    const url = j.coreUrl || null;
-    coreUrlCache.set(project, url);
-    return url;
-  } catch { return null; }
+    // The key set now rides along with the origin. Without it the pod falls
+    // back to fetching /.well-known/jwks.json itself at request time, from an
+    // origin that for most tenants nobody owns — so every identity check failed
+    // with nothing on screen to say why.
+    const core = { coreUrl: j.coreUrl || null, coreJwks: j.coreJwks || null };
+    coreUrlCache.set(project, core);
+    return core;
+  } catch { return { coreUrl: null, coreJwks: null }; }
 }
 // Tear the named tunnel + its DNS down (also invalidates the run token).
 async function teardownNamedTunnel(tunnelId, host) {
@@ -618,7 +622,8 @@ export function makeEditorCommands({ ws, version }) {
       emit('out', `starting: ${cmd}`);
       // Identity Phase 2: inject CORE_URL (tenant Core origin) + APP_ID so a
       // `core` pod can verify Core tokens locally exactly as it would in prod.
-      const coreUrl = await fetchCoreUrl(path.basename(workspace)).catch(() => null);
+      const { coreUrl, coreJwks } = await fetchCoreUrl(path.basename(workspace))
+        .catch(() => ({ coreUrl: null, coreJwks: null }));
       const binDir = path.join(cwd, 'node_modules/.bin');
       // Resolve the dev command's leading binary. If it's a bare CLI (e.g.
       // `wrangler`) that the pod did NOT install as a dependency — and isn't a
@@ -635,7 +640,8 @@ export function makeEditorCommands({ ws, version }) {
       }
       const env = {
         ...process.env, PORT: String(port),
-        ...(coreUrl ? { CORE_URL: coreUrl } : {}), APP_ID: app || 'web',
+        ...(coreUrl ? { CORE_URL: coreUrl } : {}),
+        ...(coreJwks ? { CORE_JWKS: coreJwks } : {}), APP_ID: app || 'web',
         // JG_ENV drives the pod's read-only guard: 'prod' = production data,
         // read-only; 'prod-rw' = production with writes unlocked; 'dev' = local
         // isolated data, mutable. App code never reads this — only envGuard does.
