@@ -23,7 +23,10 @@ export class Terminal {
       name: 'xterm-color',
       cols,
       rows,
-      cwd: this.cwd || process.env.HOME || process.cwd(),
+      // No silent HOME fallback: term.open refuses to construct this without a
+      // workspace, so reaching here with none is a bug worth seeing rather than
+      // a shell in the wrong directory that looks like it works.
+      cwd: this.cwd,
       env: { ...process.env, TERM: 'xterm-256color' },
     });
     this.pty.onData((data) => {

@@ -451,6 +451,19 @@ export function makeEditorCommands({ ws, version }) {
 
     // --- terminal (multi-PTY, addressed by termId) ------------------------
     'term.open': async (args, ctx) => {
+      /* WAIT FOR THE WORKSPACE. It is set by local.setup, which the console
+       * fires on connect — and the terminal is now the pane people LAND on, so
+       * it opens in the same breath and usually wins the race. With `workspace`
+       * still null, Terminal falls back to `process.env.HOME` and quietly hands
+       * you a shell in your home directory instead of the project. It looked
+       * intermittent because it was: whichever finished first.
+       *
+       * Falling back to HOME is the part that has to stop. A shell in the wrong
+       * directory is not a degraded terminal, it is a terminal pointed at the
+       * wrong files — and `claude` started there takes your home folder as its
+       * subject. Better to wait, and to say so if it never arrives. */
+      for (let i = 0; i < 100 && !workspace; i++) await new Promise((r) => setTimeout(r, 100));
+      if (!workspace) throw new Error('no workspace yet — the project is still being prepared, try again in a moment');
       const t = new Terminal({ ws, id: ctx.id, cwd: workspace });
       t.open({ cols: args.cols, rows: args.rows });
       terms.set(ctx.id, t);
