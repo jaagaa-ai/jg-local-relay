@@ -13,7 +13,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { spawn, execFile } from 'node:child_process';
 import { mkdir, readdir, readFile, writeFile, stat } from 'node:fs/promises';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Terminal } from './terminal.js';
 
@@ -261,12 +261,82 @@ async function fetchCoreUrl(project) {
 // Tear the named tunnel + its DNS down (also invalidates the run token).
 async function teardownNamedTunnel(tunnelId, host) {
   const base = apiBase();
-  if (!base || !tunnelId) return;
-  await fetch(`${base}/api/local/preview-tunnel/teardown`, {
+  if (!base || !tunnelId) return false;
+  // Returns whether jg-api actually accepted the delete. The caller clears its
+  // record on the strength of this: dropping a registration we failed to
+  // release is how a leaked hostname becomes permanent, because nothing else
+  // remembers it exists.
+  const r = await fetch(`${base}/api/local/preview-tunnel/teardown`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
     body: JSON.stringify({ tunnelId, host }),
-  }).catch(() => {});
+  }).catch(() => null);
+  return !!(r && r.ok);
+}
+
+/* PREVIEW TUNNELS OUTLIVE THE PROCESS THAT MADE THEM.
+ *
+ * `preview.start` registers a named tunnel + DNS record with jg-api, then holds
+ * the cloudflared child in an in-memory map. preview.stop tears both down. But
+ * a relay RESTART — which the hourly self-update does routinely — never calls
+ * preview.stop: the child dies, the map is lost, and the tunnel and its DNS
+ * record stay registered with nothing serving them.
+ *
+ * The visible result is Cloudflare Error 1033 on a hostname that still
+ * resolves, which is what a returning reader sees instead of their preview.
+ * The invisible result is a leaked DNS record per preview per restart, which is
+ * the subdomain exhaustion this design was already worried about — caused by
+ * leakage, not by use.
+ *
+ * So every registration is written to disk before it is used, and cleared when
+ * it is torn down. On boot we reclaim whatever the previous process left. The
+ * dev server dies with the relay too, so there is nothing to restore TO —
+ * reclaiming, not resuming, is the honest repair: the preview reads as stopped
+ * and starting it mints a fresh hostname.
+ */
+// Beside the relay's other state, per platform.
+const TUNNEL_LEDGER = (() => {
+  if (process.platform === 'darwin') return path.join(os.homedir(), 'Library/Application Support/jg-local-relay/preview-tunnels.json');
+  if (process.platform === 'win32') return path.join(process.env.LOCALAPPDATA || os.homedir(), 'jg-local-relay', 'preview-tunnels.json');
+  return path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local/state'), 'jg-local-relay', 'preview-tunnels.json');
+})();
+function readLedger() {
+  try { return JSON.parse(readFileSync(TUNNEL_LEDGER, 'utf8')) || {}; } catch { return {}; }
+}
+function writeLedger(obj) {
+  try {
+    mkdirSync(path.dirname(TUNNEL_LEDGER), { recursive: true });
+    writeFileSync(TUNNEL_LEDGER, JSON.stringify(obj), 'utf8');
+  } catch (e) { console.warn(`[preview] could not write tunnel ledger: ${e.message}`); }
+}
+function ledgerAdd(key, tunnelId, host) {
+  const l = readLedger(); l[key] = { tunnelId, host, at: Date.now() }; writeLedger(l);
+}
+function ledgerDrop(key) { const l = readLedger(); delete l[key]; writeLedger(l); }
+
+/** Boot: hand back every tunnel the previous process registered and never
+ *  released. Safe to call when the file is absent or empty. */
+export async function reclaimLeakedPreviewTunnels() {
+  const l = readLedger();
+  const keys = Object.keys(l);
+  if (!keys.length) return { reclaimed: 0 };
+  const left = {};
+  let reclaimed = 0;
+  for (const k of keys) {
+    const { tunnelId, host } = l[k] || {};
+    if (!tunnelId) continue;                       // nothing was ever registered
+    if (await teardownNamedTunnel(tunnelId, host)) {
+      reclaimed += 1;
+      console.log(`[preview] reclaimed leaked tunnel ${host || tunnelId} (left by an earlier run)`);
+    } else {
+      // jg-api unreachable, or it refused. KEEP the record and try again next
+      // boot — this is the only place that knows the hostname exists.
+      left[k] = l[k];
+      console.warn(`[preview] could not reclaim ${host || tunnelId} yet — kept for the next boot`);
+    }
+  }
+  writeLedger(left);
+  return { reclaimed, pending: Object.keys(left).length };
 }
 
 // Where the relay's stdout log lives (launchd StandardOutPath on macOS).
@@ -612,7 +682,7 @@ export function makeEditorCommands({ ws, version }) {
       if (pv) {
         try { pv.tunnel?.kill(); } catch { /* gone */ }
         killGroup(pv.proc);
-        if (pv.tunnelId) void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost);
+        if (pv.tunnelId) { void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost); ledgerDrop(`${path.basename(workspace)}:${app}`); }
         previews.delete(app);
         pv = undefined;
       }
@@ -694,6 +764,9 @@ export function makeEditorCommands({ ws, version }) {
         // a broken page. The quick-tunnel fallback below never had this,
         // because startTunnel() parses a full https:// url out of cloudflared.
         pv.tunnel = cf; pv.url = absUrl(prov.host); pv.tunnelId = prov.tunnelId; pv.tunnelHost = prov.host;
+        // Written BEFORE anyone uses it: a crash between registering and
+        // recording is exactly the case that leaks a hostname forever.
+        ledgerAdd(`${path.basename(workspace)}:${app}`, prov.tunnelId, prov.host);
         emit('tunnel', `named preview tunnel: ${pv.url} (a few seconds to route)`);
       } catch (e) {
         emit('tunnel', `named tunnel unavailable (${e.message}); using a quick tunnel`);
@@ -713,7 +786,7 @@ export function makeEditorCommands({ ws, version }) {
         try { pv.tunnel?.kill(); } catch { /* gone */ }
         killGroup(pv.proc);
         // Delete the named tunnel + DNS server-side (invalidates the run token).
-        if (pv.tunnelId) void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost);
+        if (pv.tunnelId) { void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost); ledgerDrop(`${path.basename(workspace)}:${String(args.app || '')}`); }
         previews.delete(String(args.app || ''));
       }
       return { stopped: true };

@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node test/preview-url.mjs",
+    "test": "node test/preview-url.mjs && node test/tunnel-ledger.mjs",
     "smoke": "node test/editor-smoke.mjs",
     "postinstall": "chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper 2>/dev/null || true"
   },

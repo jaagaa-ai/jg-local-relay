@@ -12,6 +12,7 @@
 //   JG_PM2_BIN         path to pm2 (default: `pm2` on PATH)
 
 import WebSocket from 'ws';
+import { reclaimLeakedPreviewTunnels } from './editor/commands.js';
 import os from 'node:os';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -190,6 +191,16 @@ restoreOwnedTunnels()
     }
   })
   .catch((e) => log(`[tunnel] boot restore error: ${e.message}`));
+
+// PREVIEW tunnels are a different class and were reclaimed by nobody. They are
+// registered with jg-api by preview.start and released by preview.stop — which
+// a restart never calls, so the hourly self-update left the tunnel and its DNS
+// record registered with nothing serving them. Visitors got Cloudflare 1033 on
+// a hostname that still resolved; the platform got a leaked DNS record per
+// preview per restart. Hand them back here, before anything can mint more.
+reclaimLeakedPreviewTunnels()
+  .then((r) => { if (r && r.reclaimed > 0) log(`[preview] reclaimed ${r.reclaimed} leaked preview tunnel(s) from an earlier run`); })
+  .catch((e) => log(`[preview] tunnel reclaim error: ${e.message}`));
 
 // A machine enrolled for the AI Editor holds a per-account token (jgr_…), which
 // the control plane does not accept — it only knows the shared operator secret.
