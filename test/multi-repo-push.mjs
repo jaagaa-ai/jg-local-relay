@@ -10,6 +10,7 @@
 //
 //   node test/multi-repo-push.mjs
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import fsSync from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
@@ -95,6 +96,33 @@ ok('the project push is reported even though it failed (no remote)',
   (res.repos ?? []).some((r) => r.repo === 'project' && r.error),
   'throwing here skipped every pod, so one bad remote hid all the pod work');
 ok('  and a failing project does NOT stop the pods being walked', names.includes('vault'));
+
+// ── excluding a pod must not exclude EVERY directory ──────────────────────
+// `sparse-checkout init --no-cone` seeds `!/*/`. Reading that back as a base
+// and appending exclusions emptied the whole checkout: pods deleted for their
+// clones, and nothing else restored either.
+{
+  const { execFileSync: X } = await import('node:child_process');
+  const p2 = path.join(home, 'a@b.c', 'sparse');
+  await mkdir(path.join(p2, 'keepme'), { recursive: true });
+  await mkdir(path.join(p2, 'gone'), { recursive: true });
+  X('git', ['init', '-q', '-b', 'main', p2], { stdio: 'ignore' });
+  await writeFile(path.join(p2, 'keepme', 'a.txt'), 'a\n');
+  await writeFile(path.join(p2, 'gone', 'b.txt'), 'b\n');
+  await writeFile(path.join(p2, 'root.md'), 'r\n');
+  X('git', ['-C', p2, 'add', '-A'], { stdio: 'ignore' });
+  X('git', ['-C', p2, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'i'], { stdio: 'ignore' });
+
+  // Mirror what the relay does, using the same pattern construction.
+  X('git', ['-C', p2, 'sparse-checkout', 'set', '--no-cone', '/*', '!/gone/'], { stdio: 'ignore' });
+  const list = X('git', ['-C', p2, 'sparse-checkout', 'list'], { encoding: 'utf8' }).split('\n').map((l) => l.trim()).filter(Boolean);
+  ok('the excluded pod is gone', !fsSync.existsSync(path.join(p2, 'gone')));
+  ok('every OTHER directory survives', fsSync.existsSync(path.join(p2, 'keepme', 'a.txt')),
+    'this is the bug: !/*/ excluded all directories and emptied the workspace');
+  ok('  and root files survive', fsSync.existsSync(path.join(p2, 'root.md')));
+  ok('  the pattern list never contains !/*/', !list.includes('!/*/'),
+    "inheriting git's init defaults is what put it there");
+}
 
 api.close();
 console.log(`\n${pass} passed, ${fail} failed`);

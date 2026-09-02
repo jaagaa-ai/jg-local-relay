@@ -355,15 +355,25 @@ export async function reclaimLeakedPreviewTunnels() {
  */
 async function excludeFromProjectCheckout(dest, pod, ctx) {
   try {
-    await run('git', ['-C', dest, 'sparse-checkout', 'init', '--no-cone']).catch(() => {});
+    /* BUILD THE PATTERN LIST; NEVER INHERIT GIT'S DEFAULTS.
+     *
+     * `sparse-checkout init --no-cone` seeds `/*` AND `!/*/` — include root
+     * files, exclude EVERY directory. Reading that back as a starting point and
+     * appending exclusions produced a checkout with no directories at all: the
+     * pods were deleted ready for their own clones, and nothing else came back
+     * either. The list has to be constructed from what we mean, not from what
+     * init happened to write.
+     *
+     * `/*` plus one `!/<pod>/` per extracted pod is the whole rule: everything,
+     * minus the folders another repo now owns.
+     */
     const cur = await run('git', ['-C', dest, 'sparse-checkout', 'list'])
       .then((r) => r.stdout.split('\n').map((l) => l.trim()).filter(Boolean))
       .catch(() => []);
-    // First call: nothing listed yet means "everything", so start from that.
-    const base = cur.length ? cur : ['/*'];
+    const excluded = cur.filter((l) => /^!\/.+\/$/.test(l) && l !== '!/*/');
     const rule = `!/${pod}/`;
-    if (!base.includes(rule)) base.push(rule);
-    await run('git', ['-C', dest, 'sparse-checkout', 'set', '--no-cone', ...base]);
+    if (!excluded.includes(rule)) excluded.push(rule);
+    await run('git', ['-C', dest, 'sparse-checkout', 'set', '--no-cone', '/*', ...excluded]);
     // The directory must be gone before a clone can create it.
     await rm(path.join(dest, pod), { recursive: true, force: true }).catch(() => {});
   } catch (e) {
