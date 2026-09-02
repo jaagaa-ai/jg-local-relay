@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { spawn, execFile } from 'node:child_process';
-import { mkdir, readdir, readFile, writeFile, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, writeFile, stat, rm } from 'node:fs/promises';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Terminal } from './terminal.js';
@@ -339,6 +339,77 @@ export async function reclaimLeakedPreviewTunnels() {
   return { reclaimed, pending: Object.keys(left).length };
 }
 
+/* Take a path out of the PROJECT checkout so a pod's own clone can own it.
+ *
+ * The folder is still tracked in the project repo — nothing was deleted there —
+ * so without this the pod clone and the project checkout claim the same
+ * directory, and `git status` in the project reports every one of the pod's
+ * files as deleted. Save would then commit that deletion.
+ *
+ * cone:false because these are explicit paths, not directory prefixes. The
+ * pattern list is rebuilt from what is already excluded plus the new path, so
+ * calling this for several pods accumulates rather than replaces.
+ *
+ * Working-tree only: sparse-checkout is local config, so this changes nothing
+ * on the remote and is undone by a fresh clone.
+ */
+async function excludeFromProjectCheckout(dest, pod, ctx) {
+  try {
+    await run('git', ['-C', dest, 'sparse-checkout', 'init', '--no-cone']).catch(() => {});
+    const cur = await run('git', ['-C', dest, 'sparse-checkout', 'list'])
+      .then((r) => r.stdout.split('\n').map((l) => l.trim()).filter(Boolean))
+      .catch(() => []);
+    // First call: nothing listed yet means "everything", so start from that.
+    const base = cur.length ? cur : ['/*'];
+    const rule = `!/${pod}/`;
+    if (!base.includes(rule)) base.push(rule);
+    await run('git', ['-C', dest, 'sparse-checkout', 'set', '--no-cone', ...base]);
+    // The directory must be gone before a clone can create it.
+    await rm(path.join(dest, pod), { recursive: true, force: true }).catch(() => {});
+  } catch (e) {
+    ctx?.logLine?.('setup', `could not exclude ${pod}/ from the project checkout: ${e.message}`);
+  }
+}
+
+/* Pods of this project that live in their OWN repo.
+ *
+ * Most projects return []: a pod only leaves the project repo when its audience
+ * stops matching the project's — published, or shared with a developer who is
+ * not granted everything.
+ *
+ * Failure returns [] deliberately. Treating an unreachable jg-api as "no pod
+ * repos" degrades to the old single-clone behaviour, which still works because
+ * the folders remain in the project repo. Treating it as an error would stop
+ * somebody working because a status endpoint was down. */
+async function fetchPodRepos(project) {
+  const base = apiBase();
+  if (!base) return [];
+  try {
+    const res = await fetch(`${base}/api/local/pod-repos?project=${encodeURIComponent(project)}&relay=${encodeURIComponent(RELAY_ID)}`, {
+      headers: { authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
+    });
+    if (!res.ok) return [];
+    const j = await res.json();
+    return Array.isArray(j.pods) ? j.pods.filter((p) => p && p.pod && p.repo) : [];
+  } catch { return []; }
+}
+
+/** A clone URL for an arbitrary repo (a pod's), minted the same way as the
+ *  project's: short-lived, single-repo-scoped, never persisted. */
+async function mintRepoCloneUrl(repo) {
+  const base = apiBase();
+  if (!base) throw new Error('no jg-api endpoint to mint a repo token');
+  const res = await fetch(`${base}/api/local/repo-token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.JG_RELAY_TOKEN || ''}` },
+    body: JSON.stringify({ repo, relay: RELAY_ID }),
+  });
+  if (!res.ok) throw new Error(`repo-token mint failed for ${repo} (${res.status})`);
+  const j = await res.json();
+  if (!j.url) throw new Error(`repo-token: no url for ${repo}`);
+  return j.url;
+}
+
 // Where the relay's stdout log lives (launchd StandardOutPath on macOS).
 const RELAY_LOG = process.env.JG_RELAY_LOG
   || (process.platform === 'darwin' ? path.join(os.homedir(), 'Library/Logs/jg-local-relay/out.log') : null);
@@ -407,6 +478,140 @@ export function makeEditorCommands({ ws, version }) {
   // Adopt the pods stamped on THIS command before it runs. Per command rather
   // than once per session: a grant can be narrowed while somebody is connected,
   // and the next command should feel it.
+  /* Commit + push ONE git repo. Extracted from the repo.push command so a
+   * project and each of its pod repos go through exactly the same rebase,
+   * conflict-parking and token handling — a second implementation for pods
+   * would drift, and this is the path that decides whether somebody's work
+   * survives. */
+  /** Pod directories in this workspace that are their OWN git repo.
+   *  A folder of the project checkout has no .git, so it is not listed — which
+   *  is exactly right: the project push already covers it. */
+  async function listPodClones() {
+    if (!workspace) return [];
+    const out = [];
+    for (const e of await readdir(workspace, { withFileTypes: true }).catch(() => [])) {
+      if (!e.isDirectory() || e.name.startsWith('.')) continue;
+      if (existsSync(path.join(workspace, e.name, '.git'))) out.push({ name: e.name, dir: path.join(workspace, e.name) });
+    }
+    return out;
+  }
+
+  /** Anything to push: uncommitted changes, or commits ahead of the remote.
+   *  Both matter — a pod committed on a previous attempt but not pushed would
+   *  otherwise be skipped for ever. */
+  async function hasLocalChanges(dir) {
+    const dirty = await run('git', ['-C', dir, 'status', '--porcelain'])
+      .then((r) => r.stdout.trim() !== '').catch(() => false);
+    if (dirty) return true;
+    return await run('git', ['-C', dir, 'rev-list', '--count', '@{u}..HEAD'])
+      .then((r) => Number(r.stdout.trim()) > 0).catch(() => false);
+  }
+
+  async function pushRepo(dir, args, ctx) {
+      const msg = args.message || 'Update from Jaagaa Local Editor';
+      // An interrupted rebase or merge — left by an earlier conflicted push, or
+      // by the relay restarting mid-rebase — blocks EVERY later git operation,
+      // including the commit a few lines down. The person then hits Push, gets a
+      // different and more confusing error each time, and has no way to clear it:
+      // the fix is a git incantation and the editor is not a terminal. Clear it
+      // here, before anything else touches the tree.
+      const gitDir = await run('git', ['-C', dir, 'rev-parse', '--git-dir'])
+        .then((r) => path.resolve(dir, r.stdout.trim())).catch(() => null);
+      if (gitDir) {
+        if (existsSync(path.join(gitDir, 'rebase-merge')) || existsSync(path.join(gitDir, 'rebase-apply'))) {
+          ctx.logLine('git', 'clearing an interrupted rebase left by an earlier push');
+          await run('git', ['-C', dir, 'rebase', '--abort']).catch(() => {});
+        }
+        if (existsSync(path.join(gitDir, 'MERGE_HEAD'))) {
+          ctx.logLine('git', 'clearing an interrupted merge left by an earlier push');
+          await run('git', ['-C', dir, 'merge', '--abort']).catch(() => {});
+        }
+        if (existsSync(path.join(gitDir, 'CHERRY_PICK_HEAD'))) {
+          await run('git', ['-C', dir, 'cherry-pick', '--abort']).catch(() => {});
+        }
+      }
+      await run('git', ['-C', dir, 'add', '-A']);
+      // Attribute the commit to the Jaagaa account that made it. The commit used
+      // to take whatever git identity happened to be configured on the machine,
+      // so on a shared or newly set up laptop every developer's work landed under
+      // one name — or none, and the commit failed outright. `account` is stamped
+      // by the hub from the proven session, so history answers "who pushed this"
+      // with the person the platform authenticated, not a local config file.
+      const acct = String(args.account || '').trim();
+      const ident = acct ? ['-c', `user.name=${acct.split('@')[0]}`, '-c', `user.email=${acct}`] : [];
+      await run('git', ['-C', dir, ...ident, 'commit', '-m', msg]).catch((e) => ctx.logLine('git', e.stderr || 'nothing to commit'));
+      const branch = (await run('git', ['-C', dir, 'rev-parse', '--abbrev-ref', 'HEAD']).then((r) => r.stdout.trim()).catch(() => 'main')) || 'main';
+      const project = path.basename(dir);
+      // Push ONLY with a per-project, repo-scoped token minted by jg-api — the
+      // SAME source the sandbox uses (jg-api getCloneUrl → JG_REPO_TOKEN). No
+      // owner credentials, ever: local and sandbox behave identically. The token
+      // is used transiently via http.extraheader so it's never persisted to
+      // .git/config; `origin` on disk stays a tokenless URL. If jg-api can't mint
+      // the token, the push fails with a clear error (don't silently fall back to
+      // the owner's git credential — that would mask a real auth/config gap).
+      const scopedUrl = await mintCloneUrl(project); // throws → surfaced to console
+      const tok = (scopedUrl.match(/\/\/x-access-token:([^@]+)@/) || [])[1] || '';
+      const authArgs = tok ? ['-c', `http.extraheader=Authorization: Basic ${Buffer.from(`x-access-token:${tok}`).toString('base64')}`] : [];
+      // Catch up on what other people pushed BEFORE pushing. local.setup only
+      // fetches — it never merges — so a second developer's checkout drifts
+      // behind the moment anyone else pushes, and their next push is rejected
+      // non-fast-forward with git's "use 'git pull'" hint, which they cannot act
+      // on from the editor. Rebase our commit onto the remote tip instead.
+      await run('git', ['-C', dir, ...authArgs, 'fetch', '--quiet', 'origin', branch], { timeout: 300_000 }).catch(() => {});
+      const behind = await run('git', ['-C', dir, 'rev-list', '--count', `HEAD..origin/${branch}`])
+        .then((r) => Number(r.stdout.trim()) || 0).catch(() => 0);
+      if (behind > 0) {
+        ctx.logLine('git', `${behind} new commit(s) on origin/${branch} — rebasing before push`);
+        try {
+          await run('git', ['-C', dir, ...ident, '-c', 'rebase.autoStash=true', 'rebase', `origin/${branch}`], { timeout: 300_000 });
+        } catch (e) {
+          const detail = String((e && (e.stderr || e.message)) || '')
+            .replace(/x-access-token:[^@]+@/g, 'x-access-token:***@').slice(0, 200);
+          // Put the tree back exactly as it was. A half-finished rebase makes
+          // every later action fail, so leaving it "as git left it" strands the
+          // dir rather than informing anyone.
+          await run('git', ['-C', dir, 'rebase', '--abort']).catch(() => {});
+          // The work still has to go SOMEWHERE. Telling someone to resolve
+          // conflicts by hand in a directory they reached through a web editor
+          // is not a fix — it is the end of the road for anyone who doesn't
+          // drive git directly. Park the commits on a branch of their own so
+          // they are safely on the remote and reviewable, and the only thing
+          // left is a merge someone can do in the GitHub UI.
+          const who = (acct.split('@')[0] || 'local').replace(/[^A-Za-z0-9._-]/g, '-');
+          const stamp = new Date().toISOString().replace(/[:-]/g, '').replace(/\..+$/, '');
+          const rescue = `jaagaa/${who}/${stamp}`;
+          let parked = null;
+          try {
+            await run('git', ['-C', dir, ...authArgs, 'push', 'origin', `HEAD:refs/heads/${rescue}`], { timeout: 180_000 });
+            parked = rescue;
+          } catch { /* remote refused it too — fall through to the plain message */ }
+          if (parked) {
+            const web = await run('git', ['-C', dir, 'remote', 'get-url', 'origin'])
+              .then((r) => r.stdout.trim().replace(/^git@github\.com:/, 'https://github.com/').replace(/\.git$/, ''))
+              .catch(() => null);
+            const link = web ? ` Open a pull request: ${web}/compare/${branch}...${encodeURIComponent(parked)}` : '';
+            const err = new Error(
+              `Your changes conflict with ${behind} new commit(s) on ${branch}, so they could not be replayed on top. `
+              + `Nothing was lost — your work is pushed to the branch "${parked}".${link} `
+              + `Your local copy is untouched and back the way it was.`,
+            );
+            err.parkedBranch = parked;
+            throw err;
+          }
+          throw new Error(`push stopped: your copy is ${behind} commit(s) behind and the changes conflict. Resolve in ${dir}, then push again. ${detail}`);
+        }
+      }
+      let stdout = '', stderr = '';
+      try {
+        ({ stdout, stderr } = await run('git', ['-C', dir, ...authArgs, 'push', 'origin', `HEAD:${branch}`], { timeout: 180_000 }));
+      } catch (e) {
+        throw new Error(`push failed: ${String((e && (e.stderr || e.message)) || e).replace(/x-access-token:[^@]+@/g, 'x-access-token:***@').slice(0, 400)}`);
+      }
+      const head = await run('git', ['-C', dir, 'rev-parse', '--short', 'HEAD']).then((r) => r.stdout.trim()).catch(() => null);
+      // Return the fields the console reads (pushed/head/branch) so it reports success.
+      return { ok: true, pushed: true, head, branch, via: 'scoped-token', output: (stdout + stderr).trim().slice(0, 1000) };
+  }
+
   const table = {
     // --- session / workspace ----------------------------------------------
     // Clone (or reuse) the project mono-repo locally + install deps, then make
@@ -445,6 +650,43 @@ export function makeEditorCommands({ ws, version }) {
         action = 'cloned';
       }
       workspace = dest;
+
+      /* PODS THAT OWN THEIR REPO ARE CLONED INTO THE SAME WORKSPACE.
+       *
+       * The layout does not change — <project>/<pod>/ either way — so nothing
+       * downstream (preview, terminal, deploy, the file tree) can tell which
+       * shape a pod is. That is the point: a mixed state is fine only while it
+       * is invisible.
+       *
+       * The project repo STILL CONTAINS these folders — nothing has been
+       * deleted from it, deliberately, because that is the one irreversible act
+       * in this migration. So the project checkout is told to skip them with
+       * sparse-checkout, and the pod's own clone takes the path. Without that
+       * the two would fight over the same directory and git would report every
+       * pod file as deleted.
+       *
+       * Best-effort per pod: one repo failing to clone must not cost you the
+       * rest of the workspace. */
+      const podRepos = await fetchPodRepos(project);
+      for (const { pod, repo } of podRepos) {
+        const podDir = path.join(dest, pod);
+        try {
+          if (existsSync(path.join(podDir, '.git'))) {
+            const u = await mintRepoCloneUrl(repo);
+            await run('git', ['-C', podDir, 'fetch', '--quiet', u], { timeout: 300_000 }).catch(() => {});
+            continue;
+          }
+          // Take the path out of the project checkout first, then clone into it.
+          await excludeFromProjectCheckout(dest, pod, ctx);
+          const u = await mintRepoCloneUrl(repo);
+          ctx.logLine('setup', `cloning ${repo} → ${pod}/`);
+          await run('git', ['clone', '--quiet', '--branch', branch, u, podDir], { timeout: 300_000 });
+          await run('git', ['-C', podDir, 'remote', 'set-url', 'origin', stripToken(u)]).catch(() => {});
+        } catch (e) {
+          ctx.logLine('setup', `pod ${pod}: ${e.message}`);
+        }
+      }
+
       if (args.install !== false && existsSync(path.join(dest, 'package.json'))) {
         ctx.logLine('setup', 'installing dependencies (npm install)…');
         await run('npm', ['install'], { cwd: dest, timeout: 600_000 }).catch((e) => ctx.logLine('setup', `npm install warning: ${e.message}`));
@@ -595,108 +837,48 @@ export function makeEditorCommands({ ws, version }) {
       return { hasRepo: true, branch, head, fileCount: files, dirty: porcelain.split('\n').filter(Boolean).length, remote };
     },
     'repo.push': async (args, ctx) => {
-      const msg = args.message || 'Update from Jaagaa Local Editor';
-      // An interrupted rebase or merge — left by an earlier conflicted push, or
-      // by the relay restarting mid-rebase — blocks EVERY later git operation,
-      // including the commit a few lines down. The person then hits Push, gets a
-      // different and more confusing error each time, and has no way to clear it:
-      // the fix is a git incantation and the editor is not a terminal. Clear it
-      // here, before anything else touches the tree.
-      const gitDir = await run('git', ['-C', workspace, 'rev-parse', '--git-dir'])
-        .then((r) => path.resolve(workspace, r.stdout.trim())).catch(() => null);
-      if (gitDir) {
-        if (existsSync(path.join(gitDir, 'rebase-merge')) || existsSync(path.join(gitDir, 'rebase-apply'))) {
-          ctx.logLine('git', 'clearing an interrupted rebase left by an earlier push');
-          await run('git', ['-C', workspace, 'rebase', '--abort']).catch(() => {});
-        }
-        if (existsSync(path.join(gitDir, 'MERGE_HEAD'))) {
-          ctx.logLine('git', 'clearing an interrupted merge left by an earlier push');
-          await run('git', ['-C', workspace, 'merge', '--abort']).catch(() => {});
-        }
-        if (existsSync(path.join(gitDir, 'CHERRY_PICK_HEAD'))) {
-          await run('git', ['-C', workspace, 'cherry-pick', '--abort']).catch(() => {});
-        }
-      }
-      await run('git', ['-C', workspace, 'add', '-A']);
-      // Attribute the commit to the Jaagaa account that made it. The commit used
-      // to take whatever git identity happened to be configured on the machine,
-      // so on a shared or newly set up laptop every developer's work landed under
-      // one name — or none, and the commit failed outright. `account` is stamped
-      // by the hub from the proven session, so history answers "who pushed this"
-      // with the person the platform authenticated, not a local config file.
-      const acct = String(args.account || '').trim();
-      const ident = acct ? ['-c', `user.name=${acct.split('@')[0]}`, '-c', `user.email=${acct}`] : [];
-      await run('git', ['-C', workspace, ...ident, 'commit', '-m', msg]).catch((e) => ctx.logLine('git', e.stderr || 'nothing to commit'));
-      const branch = (await run('git', ['-C', workspace, 'rev-parse', '--abbrev-ref', 'HEAD']).then((r) => r.stdout.trim()).catch(() => 'main')) || 'main';
-      const project = path.basename(workspace);
-      // Push ONLY with a per-project, repo-scoped token minted by jg-api — the
-      // SAME source the sandbox uses (jg-api getCloneUrl → JG_REPO_TOKEN). No
-      // owner credentials, ever: local and sandbox behave identically. The token
-      // is used transiently via http.extraheader so it's never persisted to
-      // .git/config; `origin` on disk stays a tokenless URL. If jg-api can't mint
-      // the token, the push fails with a clear error (don't silently fall back to
-      // the owner's git credential — that would mask a real auth/config gap).
-      const scopedUrl = await mintCloneUrl(project); // throws → surfaced to console
-      const tok = (scopedUrl.match(/\/\/x-access-token:([^@]+)@/) || [])[1] || '';
-      const authArgs = tok ? ['-c', `http.extraheader=Authorization: Basic ${Buffer.from(`x-access-token:${tok}`).toString('base64')}`] : [];
-      // Catch up on what other people pushed BEFORE pushing. local.setup only
-      // fetches — it never merges — so a second developer's checkout drifts
-      // behind the moment anyone else pushes, and their next push is rejected
-      // non-fast-forward with git's "use 'git pull'" hint, which they cannot act
-      // on from the editor. Rebase our commit onto the remote tip instead.
-      await run('git', ['-C', workspace, ...authArgs, 'fetch', '--quiet', 'origin', branch], { timeout: 300_000 }).catch(() => {});
-      const behind = await run('git', ['-C', workspace, 'rev-list', '--count', `HEAD..origin/${branch}`])
-        .then((r) => Number(r.stdout.trim()) || 0).catch(() => 0);
-      if (behind > 0) {
-        ctx.logLine('git', `${behind} new commit(s) on origin/${branch} — rebasing before push`);
-        try {
-          await run('git', ['-C', workspace, ...ident, '-c', 'rebase.autoStash=true', 'rebase', `origin/${branch}`], { timeout: 300_000 });
-        } catch (e) {
-          const detail = String((e && (e.stderr || e.message)) || '')
-            .replace(/x-access-token:[^@]+@/g, 'x-access-token:***@').slice(0, 200);
-          // Put the tree back exactly as it was. A half-finished rebase makes
-          // every later action fail, so leaving it "as git left it" strands the
-          // workspace rather than informing anyone.
-          await run('git', ['-C', workspace, 'rebase', '--abort']).catch(() => {});
-          // The work still has to go SOMEWHERE. Telling someone to resolve
-          // conflicts by hand in a directory they reached through a web editor
-          // is not a fix — it is the end of the road for anyone who doesn't
-          // drive git directly. Park the commits on a branch of their own so
-          // they are safely on the remote and reviewable, and the only thing
-          // left is a merge someone can do in the GitHub UI.
-          const who = (acct.split('@')[0] || 'local').replace(/[^A-Za-z0-9._-]/g, '-');
-          const stamp = new Date().toISOString().replace(/[:-]/g, '').replace(/\..+$/, '');
-          const rescue = `jaagaa/${who}/${stamp}`;
-          let parked = null;
-          try {
-            await run('git', ['-C', workspace, ...authArgs, 'push', 'origin', `HEAD:refs/heads/${rescue}`], { timeout: 180_000 });
-            parked = rescue;
-          } catch { /* remote refused it too — fall through to the plain message */ }
-          if (parked) {
-            const web = await run('git', ['-C', workspace, 'remote', 'get-url', 'origin'])
-              .then((r) => r.stdout.trim().replace(/^git@github\.com:/, 'https://github.com/').replace(/\.git$/, ''))
-              .catch(() => null);
-            const link = web ? ` Open a pull request: ${web}/compare/${branch}...${encodeURIComponent(parked)}` : '';
-            const err = new Error(
-              `Your changes conflict with ${behind} new commit(s) on ${branch}, so they could not be replayed on top. `
-              + `Nothing was lost — your work is pushed to the branch "${parked}".${link} `
-              + `Your local copy is untouched and back the way it was.`,
-            );
-            err.parkedBranch = parked;
-            throw err;
-          }
-          throw new Error(`push stopped: your copy is ${behind} commit(s) behind and the changes conflict. Resolve in ${workspace}, then push again. ${detail}`);
-        }
-      }
-      let stdout = '', stderr = '';
+      /* THE PROJECT REPO, THEN EVERY POD REPO THAT HAS CHANGES.
+       *
+       * Save is repo-wide by design — one repo, one branch — but a workspace is
+       * now several repos. Pushing only the project would silently drop every
+       * change made inside a pod that owns its repo, which is the majority of
+       * the work on a project like jaagaa.
+       *
+       * Pods with nothing to push are skipped rather than committed empty, so
+       * the result names only what actually moved. A pod that fails does not
+       * stop the others: partial success is reported honestly, because the
+       * alternative is losing the pushes that did work. */
+      // The project push is attempted like any other and its failure recorded
+      // rather than thrown: throwing here skipped every pod, so one bad remote
+      // meant a developer's pod work was never pushed AND never mentioned.
+      let first = {};
+      const results = [];
       try {
-        ({ stdout, stderr } = await run('git', ['-C', workspace, ...authArgs, 'push', 'origin', `HEAD:${branch}`], { timeout: 180_000 }));
+        first = await pushRepo(workspace, args, ctx);
+        results.push({ repo: 'project', ...first });
       } catch (e) {
-        throw new Error(`push failed: ${String((e && (e.stderr || e.message)) || e).replace(/x-access-token:[^@]+@/g, 'x-access-token:***@').slice(0, 400)}`);
+        first = { pushed: false };
+        results.push({ repo: 'project', pushed: false, error: e.message });
+        ctx.logLine('git', `project: ${e.message}`);
       }
-      const head = await run('git', ['-C', workspace, 'rev-parse', '--short', 'HEAD']).then((r) => r.stdout.trim()).catch(() => null);
-      // Return the fields the console reads (pushed/head/branch) so it reports success.
-      return { ok: true, pushed: true, head, branch, via: 'scoped-token', output: (stdout + stderr).trim().slice(0, 1000) };
+      for (const pod of await listPodClones()) {
+        try {
+          if (!(await hasLocalChanges(pod.dir))) continue;
+          const r = await pushRepo(pod.dir, args, ctx);
+          results.push({ repo: pod.name, ...r });
+        } catch (e) {
+          results.push({ repo: pod.name, pushed: false, error: e.message });
+          ctx.logLine('git', `${pod.name}: ${e.message}`);
+        }
+      }
+      const failed = results.filter((r) => r.error);
+      // `error` present means Publish stops — which is right: it deploys what
+      // was pushed, and something was not.
+      return {
+        ...first,
+        repos: results,
+        ...(failed.length ? { partial: true, error: failed.map((f) => `${f.repo}: ${f.error}`).join('; ') } : {}),
+      };
     },
 
     // --- preview (local dev server + cloudflared tunnel) ------------------
