@@ -10,7 +10,9 @@
 
 import os from 'node:os';
 import path from 'node:path';
-import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import { lookup as dnsLookup, Resolver as DnsResolver } from 'node:dns/promises';
 import { spawn, execFile } from 'node:child_process';
 import { mkdir, readdir, readFile, writeFile, stat, rm } from 'node:fs/promises';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -113,13 +115,86 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model }
 
 // cloudflared quick tunnel to a local port → public https URL (preview). Same
 // approach as jg-sandbox-runner/src/lib/tunnel.js.
-// Does the dev server actually answer on its port? (process-alive ≠ serving.)
-// Mirrors jg-sandbox-runner's probePort so the console can show live vs starting.
-function probePort(port) {
+/* Does the dev server actually answer on its port? (process-alive ≠ serving.)
+ *
+ * A TCP CONNECT, NOT AN HTTP REQUEST. This runs every 2.5s while the preview is
+ * open and every 3s for any pod that is starting or failed, and as an HTTP HEAD
+ * it wrote `HEAD / 200 OK` into the pod's own log each time — the Logs tab
+ * filled with a request nobody made, on a loop that never ends, which reads as
+ * the pod being stuck in something rather than as us knocking on the door.
+ *
+ * Accepting the connection is what "listening" means, and a wrangler that has
+ * bound its port is serving; whether it serves CORRECTLY is what the public
+ * probe below answers, over the same server. */
+export function probePort(port) {
   return new Promise((resolve) => {
-    const req = http.request({ host: '127.0.0.1', port, method: 'HEAD', path: '/', timeout: 1500 }, (res) => { res.resume(); resolve(true); });
-    req.on('error', () => resolve(false));
-    req.on('timeout', () => { req.destroy(); resolve(false); });
+    const sock = net.connect({ host: '127.0.0.1', port });
+    const done = (v) => { try { sock.destroy(); } catch { /* already gone */ } resolve(v); };
+    sock.setTimeout(1500);
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+    sock.once('timeout', () => done(false));
+  });
+}
+
+/* Is the PUBLIC preview URL actually reachable — without asking this machine's
+ * DNS.
+ *
+ * The tunnel hostname is minted seconds before it is probed, and on a machine
+ * whose resolver answers for it authoritatively — Tailscale MagicDNS is the one
+ * that caught us, and a plain negative cache in mDNSResponder is the other —
+ * that first miss is an NXDOMAIN, which is a real answer, so nothing retries and
+ * nothing falls through to the next server. `dig` resolved the name perfectly
+ * while getaddrinfo and c-ares both said ENOTFOUND, for hours.
+ *
+ * The cost of believing them was not a warning: readiness never went true, the
+ * pod sat orange with "started but never served a request" while the preview
+ * loaded fine in the browser, and the 3s sweep re-probed for ever because the
+ * state it was trying to resolve could not resolve.
+ *
+ * So we resolve it ourselves against public resolvers when the system says no,
+ * and connect to the address with the hostname carried in SNI and Host — the
+ * same thing `curl --resolve` does. The system resolver is still tried first,
+ * because when it works it is right and it is local.
+ *
+ * Returns a reason, never just false: "the tunnel is down" and "this machine
+ * cannot resolve the name" are different problems with different fixes, and the
+ * console has to be able to say which. */
+const PUBLIC_DNS = ['1.1.1.1', '8.8.8.8'];
+async function resolveHost(host) {
+  try { return { addrs: [(await dnsLookup(host, { family: 4 })).address], viaSystem: true }; } catch { /* fall through */ }
+  const r = new DnsResolver();
+  r.setServers(PUBLIC_DNS);
+  return { addrs: await r.resolve4(host), viaSystem: false }; // throws → caller reports a DNS failure
+}
+export async function probePublic(url) {
+  let host;
+  try { host = new URL(url).hostname; } catch { return { ok: false, reason: 'bad preview url' }; }
+  let addrs; let viaSystem = true;
+  try { ({ addrs, viaSystem } = await resolveHost(host)); } catch (e) {
+    return { ok: false, reason: `${host} does not resolve from anywhere (${(e && e.code) || 'dns'}) — the tunnel's DNS record is missing` };
+  }
+  if (!addrs?.length) return { ok: false, reason: `no address for ${host}` };
+  return new Promise((resolve) => {
+    const req = https.request({
+      host: addrs[0], servername: host, headers: { host }, port: 443,
+      method: 'HEAD', path: '/', timeout: 4000,
+    }, (res) => {
+      res.resume();
+      // Any HTTP answer proves the tunnel routed. A 5xx is Cloudflare's own
+      // error page (1033 and friends), not an answer from the dev server.
+      //
+      // `dnsStale` — the tunnel works, but only because we went around this
+      // machine's resolver. Anything else here that asks the OS (the BROWSER
+      // showing the preview, most of all) will still be told the name does not
+      // exist, so this is passed up rather than quietly swallowed: the preview
+      // is ready, AND the reader needs to know why their page may not load.
+      resolve(res.statusCode > 0 && res.statusCode < 500
+        ? { ok: true, dnsStale: !viaSystem, host }
+        : { ok: false, reason: `tunnel returned ${res.statusCode} — the dev server is not attached to it` });
+    });
+    req.on('error', (e) => resolve({ ok: false, reason: `tunnel unreachable (${e.code || e.message})` }));
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, reason: 'tunnel timed out' }); });
     req.end();
   });
 }
@@ -1053,7 +1128,7 @@ export function makeEditorCommands({ ws, version }) {
       child.stdout.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('out', l); });
       child.stderr.on('data', (b) => { for (const l of String(b).split('\n')) if (l) emit('err', l); });
       child.on('exit', (code) => emit('out', `[dev server exited ${code}]`));
-      pv = { proc: child, tunnel: null, url: null, port: tunnelPort, tunnelId: null, tunnelHost: null, dataEnv, prodWrite, publicOk: false };
+      pv = { proc: child, tunnel: null, url: null, port: tunnelPort, tunnelId: null, tunnelHost: null, dataEnv, prodWrite, publicOk: false, dnsStale: false };
       previews.set(app, pv);
       // Prefer a NAMED jaagaa.ai tunnel (jgc-<app>-<slug>-local.jaagaa.ai),
       // provisioned by jg-api + scoped to this one app. Fall back to a zero-
@@ -1090,15 +1165,30 @@ export function makeEditorCommands({ ws, version }) {
     },
     'preview.restart': async (args, ctx) => { await table['preview.stop'](args); return table['preview.start'](args, ctx); },
     'preview.stop': async (args) => {
-      const pv = previews.get(String(args.app || ''));
+      const app = String(args.app || '');
+      const project = String(args.project || path.basename(workspace || '') || 'app');
+      const pv = previews.get(app);
       if (pv) {
         try { pv.tunnel?.kill(); } catch { /* gone */ }
         killGroup(pv.proc);
         // Delete the named tunnel + DNS server-side (invalidates the run token).
-        if (pv.tunnelId) { void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost); ledgerDrop(`${path.basename(workspace)}:${String(args.app || '')}`); }
-        previews.delete(String(args.app || ''));
+        if (pv.tunnelId) { void teardownNamedTunnel(pv.tunnelId, pv.tunnelHost); ledgerDrop(`${path.basename(workspace)}:${app}`); }
+        previews.delete(app);
       }
-      return { stopped: true };
+      /* STOP HAS TO STOP THE ONES WE ARE NOT HOLDING EITHER.
+       *
+       * A relay restart orphans the dev server it started — the process keeps
+       * serving, `previews` no longer knows about it. Everything else in here
+       * already knows that (`preview.status` probes the PORT for exactly that
+       * reason, and `preview.start` frees it before rebinding); only stop did
+       * not, so it returned `stopped: true` having killed nothing, the next
+       * status poll found the port still answering, and the pod came straight
+       * back to life. There was no way to stop it short of killing the relay. */
+      const port = pv?.port ?? stablePort(project, app);
+      // Fewer retries than a start's: the console gives stop a 15s budget, and
+      // a port that is still held after five passes is not one more pass away.
+      const freed = port ? await freePort(port, 5) : 0;
+      return { stopped: true, killed: (pv ? 1 : 0) + freed };
     },
     // Replay the buffered log lines for an app (survives console reloads + the
     // already-running case). Shape: { app, lines:[{channel,line}] }.
@@ -1142,21 +1232,27 @@ export function makeEditorCommands({ ws, version }) {
        * expensive check stops once it passes, and a tunnel that dies later is
        * still caught by the local probe and the console's own error handling. */
       let ready = localUp;
+      let reason = localUp ? null : 'the dev server is not answering on its port';
       if (localUp && pv?.url) {
         if (pv.publicOk) ready = true;
         else {
-          try {
-            const r = await fetch(pv.url, { method: 'HEAD', redirect: 'manual', signal: AbortSignal.timeout(4000) });
-            // Any HTTP answer proves DNS resolved and the tunnel routed. A 5xx
-            // from Cloudflare (1033 and friends) is not an answer from us.
-            pv.publicOk = r.status > 0 && r.status < 500;
-          } catch { pv.publicOk = false; }
-          ready = !!pv.publicOk;
+          const r = await probePublic(pv.url);
+          pv.publicOk = r.ok;
+          if (r.ok) pv.dnsStale = !!r.dnsStale;
+          ready = r.ok;
+          reason = r.ok ? null : r.reason;
         }
       }
       // Report the live data environment so the console can show the env badge
-      // (Development / Production) + the read-only/write state.
-      return { app, running, ready, url: pv?.url ?? null, port, dataEnv: pv?.dataEnv ?? null, prodWrite: pv?.prodWrite ?? false };
+      // (Development / Production) + the read-only/write state. `reason` is why
+      // it is not ready — the console shows it verbatim rather than guessing.
+      // `dnsStale` = reachable, but not through this machine's resolver, so the
+      // browser may still fail to load it.
+      return {
+        app, running, ready, reason, url: pv?.url ?? null, port,
+        dnsStale: !!pv?.dnsStale,
+        dataEnv: pv?.dataEnv ?? null, prodWrite: pv?.prodWrite ?? false,
+      };
     },
 
     // --- publish (local wrangler) -----------------------------------------
