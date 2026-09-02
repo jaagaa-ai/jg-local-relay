@@ -124,6 +124,33 @@ ok('  and a failing project does NOT stop the pods being walked', names.includes
     "inheriting git's init defaults is what put it there");
 }
 
+// ── a dirty pod folder is never deleted ───────────────────────────────────
+// The exclusion step runs `rm -rf` so a clone can take the path. Uncommitted
+// work in that folder exists in exactly one place; deleting it destroys it.
+{
+  const { execFileSync: X } = await import('node:child_process');
+  const p3 = path.join(home, 'a@b.c', 'dirty');
+  await mkdir(path.join(p3, 'vault'), { recursive: true });
+  X('git', ['init', '-q', '-b', 'main', p3], { stdio: 'ignore' });
+  await writeFile(path.join(p3, 'vault', 'a.ts'), 'committed\n');
+  X('git', ['-C', p3, 'add', '-A'], { stdio: 'ignore' });
+  X('git', ['-C', p3, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'i'], { stdio: 'ignore' });
+  // Unsaved work, the thing that must survive.
+  await writeFile(path.join(p3, 'vault', 'a.ts'), 'UNCOMMITTED EDIT\n');
+
+  const src = fsSync.readFileSync(new URL('../src/editor/commands.js', import.meta.url), 'utf8');
+  ok('the delete is guarded by a dirty check', /status', '--porcelain', '--', pod/.test(src),
+    'rm -rf on a working tree with no check is how somebody loses an afternoon');
+  ok('  and the guard runs BEFORE the rm', src.indexOf("--porcelain', '--', pod") < src.indexOf('await rm(path.join(dest, pod)'),
+    'checking after deleting is not a check');
+  ok('  a failed exclusion skips the clone', /if \(!\(await excludeFromProjectCheckout\(dest, pod, ctx\)\)\) continue;/.test(src),
+    'cloning into a directory we failed to clear leaves neither the folder nor the clone');
+  ok('  the guard reports instead of swallowing', /return false;/.test(src));
+  // The fixture still has its edit — nothing in this test may touch it.
+  ok('the uncommitted edit is still on disk',
+    fsSync.readFileSync(path.join(p3, 'vault', 'a.ts'), 'utf8').includes('UNCOMMITTED'));
+}
+
 api.close();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

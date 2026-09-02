@@ -355,6 +355,32 @@ export async function reclaimLeakedPreviewTunnels() {
  */
 async function excludeFromProjectCheckout(dest, pod, ctx) {
   try {
+    /* THE PROJECT REPO MUST IGNORE THE PATH, tracked or not.
+     *
+     * A pod clone sitting inside the project checkout is an UNTRACKED
+     * directory to git — and `repo.push` runs `git add -A`, which would add it
+     * as a gitlink and commit five bogus embedded-repo entries into the project
+     * repo. The Changes panel would show five permanently-dirty folders too.
+     *
+     * .git/info/exclude, not .gitignore: this is a fact about one checkout on
+     * one machine, not about the project. Committing it would push a list that
+     * is wrong for anyone whose grants differ.
+     */
+    const exclude = path.join(dest, '.git', 'info', 'exclude');
+    const line = `/${pod}/`;
+    const curExcl = await readFile(exclude, 'utf8').catch(() => '');
+    if (!curExcl.split('\n').some((l) => l.trim() === line)) {
+      await mkdir(path.dirname(exclude), { recursive: true }).catch(() => {});
+      await writeFile(exclude, `${curExcl.replace(/\n*$/, '\n')}${line}\n`, 'utf8');
+    }
+
+    // Tracked in the project repo? Then it also has to leave the checkout.
+    // A pod whose folder was never in this repo (the post-migration case) needs
+    // only the ignore above — there is nothing to exclude or delete.
+    const tracked = await run('git', ['-C', dest, 'ls-files', '--error-unmatch', `${pod}/`])
+      .then(() => true).catch(() => false);
+    if (!tracked) return true;
+
     /* BUILD THE PATTERN LIST; NEVER INHERIT GIT'S DEFAULTS.
      *
      * `sparse-checkout init --no-cone` seeds `/*` AND `!/*/` — include root
@@ -373,11 +399,36 @@ async function excludeFromProjectCheckout(dest, pod, ctx) {
     const excluded = cur.filter((l) => /^!\/.+\/$/.test(l) && l !== '!/*/');
     const rule = `!/${pod}/`;
     if (!excluded.includes(rule)) excluded.push(rule);
+    /* NEVER DELETE UNCOMMITTED WORK.
+     *
+     * This removes a directory so a clone can take the path, and `rm -rf` on a
+     * developer's working tree is the most destructive thing in this file. If
+     * that folder has edits nobody has committed, they exist in exactly one
+     * place and deleting it destroys them.
+     *
+     * So the tree is checked first and extraction is REFUSED for that pod when
+     * it is dirty. The pod stays a folder — which still works — and the next
+     * setup tries again once the work is saved. A pod that is merely
+     * uncommitted is not worth someone's afternoon.
+     */
+    const dirty = await run('git', ['-C', dest, 'status', '--porcelain', '--', pod])
+      .then((r) => r.stdout.trim()).catch(() => '');
+    if (dirty) {
+      throw new Error(
+        `${pod}/ has uncommitted changes — not moving it to its own repo yet. `
+        + `Save your work, then reopen the project.`,
+      );
+    }
     await run('git', ['-C', dest, 'sparse-checkout', 'set', '--no-cone', '/*', ...excluded]);
-    // The directory must be gone before a clone can create it.
+    // Only now is the directory safe to remove: it is tracked, clean, and its
+    // content is in the project repo's history.
     await rm(path.join(dest, pod), { recursive: true, force: true }).catch(() => {});
+    return true;
   } catch (e) {
-    ctx?.logLine?.('setup', `could not exclude ${pod}/ from the project checkout: ${e.message}`);
+    // Reported, not swallowed: the caller must NOT clone into a directory we
+    // failed to clear, and a pod left as a folder is a working outcome.
+    ctx?.logLine?.('setup', `keeping ${pod}/ in the project repo: ${e.message}`);
+    return false;
   }
 }
 
@@ -686,8 +737,10 @@ export function makeEditorCommands({ ws, version }) {
             await run('git', ['-C', podDir, 'fetch', '--quiet', u], { timeout: 300_000 }).catch(() => {});
             continue;
           }
-          // Take the path out of the project checkout first, then clone into it.
-          await excludeFromProjectCheckout(dest, pod, ctx);
+          // Take the path out of the project checkout first. If that did not
+          // happen — dirty tree, git error — do NOT clone: the folder is still
+          // there, still correct, and cloning onto it would fail anyway.
+          if (!(await excludeFromProjectCheckout(dest, pod, ctx))) continue;
           const u = await mintRepoCloneUrl(repo);
           ctx.logLine('setup', `cloning ${repo} → ${pod}/`);
           await run('git', ['clone', '--quiet', '--branch', branch, u, podDir], { timeout: 300_000 });
