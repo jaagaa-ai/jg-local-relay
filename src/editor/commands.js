@@ -1398,8 +1398,41 @@ export function makeEditorCommands({ ws, getWs, version }) {
       const prompt = String(args?.prompt || '').slice(0, 16000);
       if (!prompt) throw new Error('agent.run needs a prompt');
       const app = /^[a-z][a-z0-9-]{0,30}$/.test(String(args?.app || '')) ? String(args.app) : null;
+
+      /* ADOPT THE CHECKOUT THAT IS ALREADY HERE.
+       *
+       * `workspace` is set by local.setup, which only the AI EDITOR fires. A
+       * task arriving from the portal has no editor behind it, so on a relay
+       * nobody had opened the editor on this run, every question failed with
+       * "no workspace yet - the project is still being prepared" while the
+       * project sat on disk, cloned, exactly where we would have put it.
+       *
+       * So when there is no active workspace, look where local.setup would
+       * have left one and use it if it is there. The project and account are
+       * stamped by jg-api from the signed tenant and its proven owner - never
+       * by a browser - so this cannot be pointed at another account's tree.
+       *
+       * DELIBERATELY DOES NOT CLONE. Cloning a repo and installing its
+       * dependencies is minutes of work and a real change to somebody's
+       * machine; doing it as a silent side effect of a question, inside a
+       * request that gives up after two minutes, would produce a timeout and
+       * a half-prepared directory. Absent, we say plainly what is missing and
+       * how one press fixes it. */
+      if (!workspace) {
+        const proj = String(args?.project || '').trim();
+        if (/^[a-z0-9][a-z0-9._-]{0,60}$/i.test(proj)) {
+          const guess = path.join(accountRoot(args?.account), proj);
+          if (existsSync(path.join(guess, '.git'))) workspace = guess;
+        }
+      }
       const cwd = app ? resolveIn(app) : workspace;
-      if (!cwd) throw new Error('no workspace yet - the project is still being prepared');
+      if (!cwd) {
+        const proj = String(args?.project || '').trim() || 'this project';
+        throw new Error(
+          `This machine has no copy of ${proj} yet. Open the AI Editor for it once `
+          + `so it can be set up, then ask again.`,
+        );
+      }
       const cli = /^(opencode|claude|codex|gemini)$/.test(String(args?.cli || '')) ? String(args.cli) : 'claude';
       const model = /^[a-z0-9][a-z0-9._/-]{0,60}$/i.test(String(args?.model || '')) ? String(args.model) : null;
       const timeoutMs = Math.min(Math.max(Number(args?.timeoutMs) || 120000, 1000), 15 * 60 * 1000);
