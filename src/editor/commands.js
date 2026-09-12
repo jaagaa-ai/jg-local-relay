@@ -550,7 +550,8 @@ async function mintRepoCloneUrl(repo) {
 const RELAY_LOG = process.env.JG_RELAY_LOG
   || (process.platform === 'darwin' ? path.join(os.homedir(), 'Library/Logs/jg-local-relay/out.log') : null);
 
-export function makeEditorCommands({ ws, version }) {
+export function makeEditorCommands({ ws, getWs, version }) {
+  const wsNow = typeof getWs === 'function' ? getWs : () => ws;
   let workspace = null;            // absolute path of the active project dir
   const terms = new Map();         // termId -> Terminal
   const procs = new Map();         // name -> { child, logs:[] }
@@ -895,7 +896,7 @@ export function makeEditorCommands({ ws, version }) {
        * root, which is also the honest answer when no pod is named. */
       const rel = typeof args?.path === 'string' ? args.path.trim() : '';
       const cwd = rel ? resolveIn(rel) : workspace;
-      const t = new Terminal({ ws, id: ctx.id, cwd });
+      const t = new Terminal({ getWs: wsNow, id: ctx.id, cwd });
       t.open({ cols: args.cols, rows: args.rows });
       terms.set(ctx.id, t);
       return { opened: true, termId: ctx.id };
@@ -1348,5 +1349,23 @@ export function makeEditorCommands({ ws, version }) {
     (args, ctx) => { setPods(args?.pods); return fn(args, ctx); },
   ]));
 
-  return { table: guarded, dispose };
+  /**
+   * DETACH IS NOT DISPOSE.
+   *
+   * The relay's socket dropping means nobody is watching - not that the work
+   * should stop. Terminals stop writing and keep running; everything else
+   * (previews, dev servers) is untouched, because it never belonged to the
+   * socket in the first place.
+   */
+  function detach() { for (const t of terms.values()) { try { t.detach(); } catch { /* gone */ } } }
+  /** A browser is back: resume, replaying whatever was missed. */
+  function attach() { for (const t of terms.values()) { try { t.attach(); } catch { /* gone */ } } }
+  /** Oldest activity across this session's terminals, for idle reaping. */
+  function lastUsed() {
+    let t = 0; for (const x of terms.values()) if (x.lastUsed > t) t = x.lastUsed;
+    return t || Date.now();
+  }
+  function liveTerms() { return terms.size; }
+
+  return { table: guarded, dispose, detach, attach, lastUsed, liveTerms };
 }

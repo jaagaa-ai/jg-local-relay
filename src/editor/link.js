@@ -86,15 +86,32 @@ export function startEditorLink({ version }) {
     // other's uncommitted work, checked-out branch or dev server.
     const key = `${String(account || '__noacct__')}::${String(project || '__default__')}`;
     let e = editors.get(key);
-    if (!e) { e = makeEditorCommands({ ws, version }); editors.set(key, e); log(`spawned editor session for project "${key}"`); }
+    if (!e) { e = makeEditorCommands({ getWs: () => ws, version }); editors.set(key, e); log(`spawned editor session for project "${key}"`); }
+    e.attach?.();
     return e;
   };
+  const detachAll = () => { for (const e of editors.values()) { try { e.detach?.(); } catch { /* gone */ } } };
   const disposeAll = () => { for (const e of editors.values()) { try { e.dispose(); } catch { /* gone */ } } editors = new Map(); };
+  /** Reap sessions nobody has come back to. A PTY on a machine no one is
+   *  watching is a process nobody will ever kill by hand. */
+  const IDLE_MS = Number(process.env.JG_TERM_IDLE_MS || 6 * 60 * 60 * 1000);
+  const reap = () => {
+    const now = Date.now();
+    for (const [key, e] of [...editors.entries()]) {
+      try {
+        if (!e.lastUsed || !e.liveTerms) continue;
+        if (e.liveTerms() === 0) continue;
+        if (now - e.lastUsed() < IDLE_MS) continue;
+        log(`reaping idle session "${key}"`);
+        e.dispose(); editors.delete(key);
+      } catch { /* gone */ }
+    }
+  };
+  setInterval(reap, 10 * 60 * 1000).unref?.();
 
   function connect() {
     log(`connecting → ${url} as "${relayId}"`);
     ws = new WebSocket(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
-    disposeAll();
 
     let alive = true;
     ws.on('pong', () => { alive = true; });
@@ -137,7 +154,8 @@ export function startEditorLink({ version }) {
 
     ws.on('close', () => {
       clearInterval(heartbeat);
-      disposeAll();
+      // Nobody is watching. The work keeps running; see detachAll.
+      detachAll();
       const wait = Math.min(backoff, MAX_BACKOFF_MS);
       log(`disconnected; reconnecting in ${wait}ms`);
       setTimeout(connect, wait);
