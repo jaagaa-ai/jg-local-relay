@@ -1301,6 +1301,50 @@ export function makeEditorCommands({ ws, getWs, version }) {
     },
 
     // --- agent chat (the user's OWN local CLI: claude / opencode / …) ------
+    /* --- agent.status: IS THE STEP ALREADY DONE? --------------------------
+     *
+     * The "run an AI in it" strip asks for three steps and has no idea whether
+     * any of them is already behind you. Somebody who installed `claude` months
+     * ago is told to install it, every time they open the panel, which reads as
+     * "this thing does not know me".
+     *
+     * Two questions, answered without running the CLI: is the binary there, and
+     * has it been signed in. Running `claude` to find out would be slower and
+     * could sit waiting for input - the one thing a status check must never do.
+     *
+     * NOTHING HERE READS A SECRET. Existence only: the keychain entry is
+     * queried with -w discarded, and the credentials file is stat'd rather than
+     * opened. What is reported is a yes or a no.
+     */
+    'agent.status': async () => {
+      const which = (bin) => new Promise((res) => {
+        execFile(process.platform === 'win32' ? 'where' : 'which', [bin], { timeout: 4000 }, (err, out) => {
+          res(err ? null : String(out).split('\n')[0].trim() || null);
+        });
+      });
+      const version = (bin) => new Promise((res) => {
+        execFile(bin, ['--version'], { timeout: 6000 }, (err, out) => {
+          res(err ? null : String(out).trim().split('\n')[0].slice(0, 60) || null);
+        });
+      });
+      const claudeSignedIn = async () => {
+        // Linux/Windows keep a credentials file; macOS puts it in the keychain.
+        try { if (existsSync(path.join(os.homedir(), '.claude', '.credentials.json'))) return true; } catch { /* no */ }
+        if (process.platform !== 'darwin') return false;
+        return await new Promise((res) => {
+          execFile('security', ['find-generic-password', '-s', 'Claude Code-credentials'], { timeout: 4000 },
+            (err) => res(!err));
+        });
+      };
+      const out = {};
+      for (const bin of ['claude', 'codex', 'gemini', 'opencode']) {
+        const p = await which(bin);
+        out[bin] = { installed: !!p, path: p, version: p ? await version(bin) : null };
+      }
+      if (out.claude.installed) out.claude.signedIn = await claudeSignedIn();
+      return out;
+    },
+
     /* --- relay lifecycle ---------------------------------------------------
      *
      * MANAGING THE RELAY SHOULD NOT REQUIRE REMEMBERING A COMMAND. Updating it
