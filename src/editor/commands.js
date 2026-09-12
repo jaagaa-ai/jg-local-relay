@@ -16,6 +16,11 @@ import { lookup as dnsLookup, Resolver as DnsResolver } from 'node:dns/promises'
 import { spawn, execFile } from 'node:child_process';
 import { mkdir, readdir, readFile, writeFile, stat, rm } from 'node:fs/promises';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { checkForUpdateNow } from '../self-update.js';
+
+/** Where this relay is installed — the package.json beside src/, so
+ *  relay.version reports what is RUNNING rather than what a checkout says. */
+const APP_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 import { fileURLToPath } from 'node:url';
 import { Terminal } from './terminal.js';
 
@@ -1296,6 +1301,40 @@ export function makeEditorCommands({ ws, getWs, version }) {
     },
 
     // --- agent chat (the user's OWN local CLI: claude / opencode / …) ------
+    /* --- relay lifecycle ---------------------------------------------------
+     *
+     * MANAGING THE RELAY SHOULD NOT REQUIRE REMEMBERING A COMMAND. Updating it
+     * and restarting it were things a person had to be told to type into a
+     * terminal, which means they were things a person forgot, which is how a
+     * machine ends up weeks behind without anyone noticing.
+     *
+     * The relay can do both to ITSELF, so the console can offer them as
+     * buttons. There is deliberately no `stop`: a stopped relay cannot be
+     * started again from here, because nothing would be listening. That one
+     * stays where the hardware is.
+     */
+    'relay.version': async () => {
+      let installed = null;
+      try {
+        installed = JSON.parse(readFileSync(path.join(APP_ROOT, 'package.json'), 'utf8')).version ?? null;
+      } catch { /* running from a checkout without one */ }
+      return { version: installed, pid: process.pid, node: process.version, platform: process.platform, uptimeSec: Math.round(process.uptime()) };
+    },
+    'relay.update': async () => {
+      // Returns BEFORE the swap can happen: a successful update exits this
+      // process, so a caller waiting for "done" would be waiting for a reply
+      // from something that no longer exists. Say it has begun; the caller
+      // learns it worked by seeing the relay come back on a new version.
+      setTimeout(() => { void checkForUpdateNow('asked'); }, 50);
+      return { started: true, note: 'if a newer build exists the relay swaps to it and restarts' };
+    },
+    'relay.restart': async () => {
+      // Same reasoning: answer first, exit after. launchd (or systemd) brings
+      // it straight back, which is what makes this safe to offer at all.
+      setTimeout(() => process.exit(0), 50);
+      return { restarting: true };
+    },
+
     /* --- agent.run: ONE QUESTION, ONE ANSWER --------------------------------
      *
      * agent.chat streams frames at a browser and resolves an exit code, which
