@@ -1296,6 +1296,67 @@ export function makeEditorCommands({ ws, getWs, version }) {
     },
 
     // --- agent chat (the user's OWN local CLI: claude / opencode / …) ------
+    /* --- agent.run: ONE QUESTION, ONE ANSWER --------------------------------
+     *
+     * agent.chat streams frames at a browser and resolves an exit code, which
+     * is right for a person watching a terminal and useless to a caller that
+     * wants the answer. A job needs the text back.
+     *
+     * Same builder, same CLIs, same one-shot invocation (`claude -p …`) - the
+     * difference is that stdout is collected and returned. NOT a line typed into
+     * a live REPL: knowing where an answer ENDS in a stream of prompts and
+     * spinners is guesswork, and guessing wrong truncates or hangs. A process
+     * with an exit code has neither problem.
+     *
+     * Bounded on both axes, because the caller is a program and programs retry:
+     * a wall-clock timeout, and a cap on how much output is carried back.
+     */
+    'agent.run': async (args) => {
+      const prompt = String(args?.prompt || '').slice(0, 16000);
+      if (!prompt) throw new Error('agent.run needs a prompt');
+      const app = /^[a-z][a-z0-9-]{0,30}$/.test(String(args?.app || '')) ? String(args.app) : null;
+      const cwd = app ? resolveIn(app) : workspace;
+      if (!cwd) throw new Error('no workspace yet - the project is still being prepared');
+      const cli = /^(opencode|claude|codex|gemini)$/.test(String(args?.cli || '')) ? String(args.cli) : 'claude';
+      const model = /^[a-z0-9][a-z0-9._/-]{0,60}$/i.test(String(args?.model || '')) ? String(args.model) : null;
+      const timeoutMs = Math.min(Math.max(Number(args?.timeoutMs) || 120000, 1000), 15 * 60 * 1000);
+      const maxOut = Math.min(Math.max(Number(args?.maxOutputBytes) || 256 * 1024, 1024), 4 * 1024 * 1024);
+      const { bin, argv } = buildAgentRun({ cli, prompt, convId: null, convName: null, resume: false, started: false, model });
+      return await new Promise((resolve) => {
+        let child;
+        try { child = spawn(bin, argv, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        catch (e) { return void resolve({ ok: false, error: `failed to start ${bin}: ${e.message}` }); }
+        let out = '', err = '', truncated = false, done = false;
+        const take = (d, which) => {
+          const t = d.toString('utf8');
+          if (which === 'out') {
+            if (out.length + t.length > maxOut) { out += t.slice(0, Math.max(0, maxOut - out.length)); truncated = true; }
+            else out += t;
+          } else if (err.length < 8192) err += t.slice(0, 8192 - err.length);
+        };
+        child.stdout?.on('data', (d) => take(d, 'out'));
+        child.stderr?.on('data', (d) => take(d, 'err'));
+        // A HUNG CLI IS THE FAILURE MODE THAT MATTERS. Killed, and what it had
+        // already said is returned - a partial answer with a reason beats a
+        // promise that never settles, which would wedge the job queue behind it.
+        const timer = setTimeout(() => {
+          if (done) return;
+          try { child.kill('SIGKILL'); } catch { /* gone */ }
+          done = true;
+          resolve({ ok: false, error: `timed out after ${timeoutMs}ms`, timedOut: true, output: out, stderr: err, truncated });
+        }, timeoutMs);
+        timer.unref?.();
+        child.on('error', (e) => {
+          if (done) return; done = true; clearTimeout(timer);
+          resolve({ ok: false, error: String(e?.message || e) });
+        });
+        child.on('close', (exitCode) => {
+          if (done) return; done = true; clearTimeout(timer);
+          resolve({ ok: exitCode === 0, exitCode, output: out, stderr: err, truncated, cli, bin });
+        });
+      });
+    },
+
     'agent.chat': async (args, ctx) => {
       const prompt = String(args.prompt || '').slice(0, 16000);
       if (!prompt) return { skipped: 'empty' };
