@@ -1667,7 +1667,28 @@ export function makeEditorCommands({ ws, getWs, version }) {
         });
         child.on('close', (exitCode) => {
           if (done) return; done = true; clearTimeout(timer);
-          resolve({ ok: exitCode === 0, exitCode, output: out, stderr: err, truncated, cli, bin });
+          /* A CREDENTIAL THAT EXISTS IS NOT A CREDENTIAL THAT WORKS.
+           *
+           * agent.status answers "is there a sign-in" by looking for a keychain
+           * entry, which cannot tell a live session from an expired one — so a
+           * lapsed login reports as signed in, the indicator stays green, and
+           * the failure arrives as whatever the CLI happened to print. The
+           * reader is then debugging their question instead of their session.
+           *
+           * The run is the only place the truth shows up, so name it here. The
+           * fix is on the machine and nowhere else: Jaagaa never holds this
+           * credential and has nothing to reset. */
+          const blob = `${out}\n${err}`.toLowerCase();
+          const authy = exitCode !== 0 && /(not logged in|please log ?in|\/login|unauthor|authentication|invalid api key|session (has )?expired|token (has )?expired|credentials)/.test(blob);
+          resolve({
+            ok: exitCode === 0, exitCode, output: out, stderr: err, truncated, cli, bin,
+            ...(authy ? {
+              authExpired: true,
+              error: `${cli} on this machine is not signed in, or its session has expired. `
+                + `Open a terminal there, run \`${cli}\`, then \`/login\` — it is remembered afterwards. `
+                + `To use a different account, \`/logout\` first. Jaagaa never holds this credential, so there is nothing to change here.`,
+            } : {}),
+          });
         });
       });
     },
