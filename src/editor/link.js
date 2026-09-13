@@ -84,7 +84,22 @@ export function startEditorLink({ version }) {
     // Keyed by account AND project: the same project opened by two accounts on
     // one machine gets two sessions with two workspaces, so neither inherits the
     // other's uncommitted work, checked-out branch or dev server.
-    const key = `${String(account || '__noacct__')}::${String(project || '__default__')}`;
+    //
+    // A TASK WITH NO ACCOUNT IS THIS MACHINE'S OWNER, NOT A STRANGER.
+    //
+    // The hub stamps `account` onto commands it relays from a BROWSER, and on
+    // nothing else — so a job sent server-side arrives bare and used to land
+    // under "__noacct__", a session of its own with an empty workspace. The
+    // editor could be open on the very same project, with the repo cloned and
+    // local.setup long since run, and the job would still report that this
+    // machine has no copy of it: right machine, right clone, wrong closure.
+    //
+    // allowed-accounts.txt names the owner, written by whoever holds the
+    // hardware. Using it here is not a widening of access — an un-stamped
+    // command has already been authorised by the relay's own token — it just
+    // stops the same person's work being split across two sessions.
+    const acct = account || readAccounts().owner || null;
+    const key = `${String(acct || '__noacct__')}::${String(project || '__default__')}`;
     let e = editors.get(key);
     if (!e) { e = makeEditorCommands({ getWs: () => ws, version }); editors.set(key, e); log(`spawned editor session for project "${key}"`); }
     e.attach?.();
