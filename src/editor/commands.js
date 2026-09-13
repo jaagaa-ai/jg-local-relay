@@ -631,6 +631,17 @@ const RELAY_LOG = process.env.JG_RELAY_LOG
   || (process.platform === 'darwin' ? path.join(os.homedir(), 'Library/Logs/jg-local-relay/out.log') : null);
 
 export function makeEditorCommands({ ws, getWs, version }) {
+  /* AGENT RUNS WERE NEVER LOGGED AT ALL.
+   *
+   * The relay records connections, updates and sessions, and not one line about
+   * the thing it mainly exists to do. So a question that failed left no trace
+   * anywhere: not the prompt, not how long it took, not the exit code. The only
+   * evidence was whatever the browser happened to render, which for a killed
+   * process is nothing. Debugging it meant guessing.
+   *
+   * The prompt is truncated hard — it is somebody's data, and a log is the
+   * wrong place to keep it in full. Enough to recognise which run this was. */
+  const alog = (...a) => console.log(new Date().toISOString(), '[agent]', ...a);
   const wsNow = typeof getWs === 'function' ? getWs : () => ws;
   let workspace = null;            // absolute path of the active project dir
   const terms = new Map();         // termId -> Terminal
@@ -1680,6 +1691,9 @@ export function makeEditorCommands({ ws, getWs, version }) {
       const timeoutMs = Math.min(Math.max(Number(args?.timeoutMs) || 120000, 1000), 15 * 60 * 1000);
       const maxOut = Math.min(Math.max(Number(args?.maxOutputBytes) || 256 * 1024, 1024), 4 * 1024 * 1024);
       const { bin, argv } = buildAgentRun({ cli, prompt, convId: null, convName: null, resume: false, started: false, model });
+      const _t0 = Date.now();
+      alog(`run ${cli}${model ? ' (' + model + ')' : ''} in ${cwd}` + (apiToken ? ' with an API token' : ' with no API token')
+        + ` — ${JSON.stringify(String(asked).slice(0, 120))}`);
       // The credential reaches the agent through the ENVIRONMENT and nowhere
       // else: not a file, not an argument. Arguments are visible in `ps` to
       // every process on the machine, and a file outlives the run that needed it.
@@ -1705,15 +1719,19 @@ export function makeEditorCommands({ ws, getWs, version }) {
           if (done) return;
           try { child.kill('SIGKILL'); } catch { /* gone */ }
           done = true;
+          alog(`TIMED OUT after ${Math.round(timeoutMs / 1000)}s — killed; out=${out.length}b err=${err.length}b`);
           resolve({ ok: false, error: `timed out after ${timeoutMs}ms`, timedOut: true, output: out, stderr: err, truncated });
         }, timeoutMs);
         timer.unref?.();
         child.on('error', (e) => {
           if (done) return; done = true; clearTimeout(timer);
+          alog(`FAILED TO START ${bin}: ${String(e?.message || e)}`);
           resolve({ ok: false, error: String(e?.message || e) });
         });
         child.on('close', (exitCode) => {
           if (done) return; done = true; clearTimeout(timer);
+          alog(`done exit=${exitCode} in ${Math.round((Date.now() - _t0) / 1000)}s`
+            + ` out=${out.length}b err=${err.length}b${truncated ? ' (truncated)' : ''}`);
           /* A CREDENTIAL THAT EXISTS IS NOT A CREDENTIAL THAT WORKS.
            *
            * agent.status answers "is there a sign-in" by looking for a keychain
