@@ -1019,7 +1019,12 @@ export function makeEditorCommands({ ws, getWs, version }) {
       terms.set(ctx.id, t);
       // Start the CLI immediately: the reader asked to sign in, not for a shell
       // they then have to know the command for.
-      setTimeout(() => { try { t.input(`${cli}\r`); } catch { /* gone */ } }, 250);
+      // input() takes BASE64 — it is the browser's own keystroke path, where
+      // every frame arrives encoded. Handing it raw text made it decode
+      // "claude\r" as if it were base64 and type the wreckage into the shell.
+      setTimeout(() => {
+        try { t.input(Buffer.from(`${cli}\r`, 'utf8').toString('base64')); } catch { /* gone */ }
+      }, 250);
       return { opened: true, termId: ctx.id, cwd, cli };
     },
 
