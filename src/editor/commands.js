@@ -1493,6 +1493,61 @@ export function makeEditorCommands({ ws, getWs, version }) {
        * request that gives up after two minutes, would produce a timeout and
        * a half-prepared directory. Absent, we say plainly what is missing and
        * how one press fixes it. */
+      /* AN ASSISTANT TASK IS NOT A CODE TASK, AND DOES NOT BELONG IN THE CODE.
+       *
+       * This reused the editor's workspace — the project's git checkout — so a
+       * question about intake records was answered by an agent sitting in a
+       * marketing site's source tree, with the operator's Cloudflare token and
+       * git credentials within reach and nothing in the folder that could
+       * answer the question. Wrong on both sides: no data to find, and far too
+       * much else to find.
+       *
+       * Given an API credential, the task gets its own empty directory instead.
+       * The agent is a CLIENT of the tenant's API — it answers by calling the
+       * endpoints the UI calls, as the admin who asked — so the filesystem is
+       * not its subject and should not be its surroundings. Nothing here is
+       * checked out, nothing here is secret, and a task that goes looking for
+       * files finds an empty room and a note telling it where the API is.
+       */
+      const apiBase = String(args?.apiBase || '').trim();
+      const apiToken = String(args?.apiToken || '').trim();
+      if (apiBase && apiToken) {
+        const proj = /^[a-z0-9][a-z0-9._-]{0,60}$/i.test(String(args?.project || '')) ? String(args.project) : 'default';
+        const room = path.join(accountRoot(args?.account || declaredOwner()), '.assistant', proj);
+        try {
+          mkdirSync(room, { recursive: true });
+          // The brief, rewritten each run so it can never describe a stale
+          // surface. The TOKEN is not in it — a file is a thing that outlives
+          // the run; the environment is not.
+          writeFileSync(path.join(room, 'README.md'),
+            [
+              '# Assistant workspace',
+              '',
+              'You are answering for an ADMIN of this workspace, through its HTTP API.',
+              '',
+              `- API base: ${apiBase}`,
+              '- Auth: send `Authorization: Bearer $JG_API_TOKEN` (already in your environment).',
+              '- The token is this admin\'s own, expires in minutes, and grants exactly',
+              '  what they can do in the UI — no more, no less.',
+              '',
+              'Answer by calling the API. Do not look for a database, do not use',
+              'wrangler, and do not go looking through the filesystem: this folder is',
+              'deliberately empty and nothing else on this machine is your subject.',
+              '',
+              'Useful starting points:',
+              '  GET  /api/portal/admin/customers',
+              '  GET  /api/portal/admin/activity',
+              '  GET  /api/intake/admin/rfis',
+              '',
+              'Anything the admin can do in the UI, you can do here — including',
+              'creating and changing forms. Prefer a read before a write, and say',
+              'plainly what you changed.',
+              '',
+            ].join('\n'), 'utf8');
+        } catch { /* unwritable → fall through to the checkout logic below */ }
+        if (existsSync(room)) workspace = room;
+      }
+
       const tried = [];
       if (!workspace) {
         const proj = String(args?.project || '').trim();
@@ -1540,9 +1595,13 @@ export function makeEditorCommands({ ws, getWs, version }) {
       const timeoutMs = Math.min(Math.max(Number(args?.timeoutMs) || 120000, 1000), 15 * 60 * 1000);
       const maxOut = Math.min(Math.max(Number(args?.maxOutputBytes) || 256 * 1024, 1024), 4 * 1024 * 1024);
       const { bin, argv } = buildAgentRun({ cli, prompt, convId: null, convName: null, resume: false, started: false, model });
+      // The credential reaches the agent through the ENVIRONMENT and nowhere
+      // else: not a file, not an argument. Arguments are visible in `ps` to
+      // every process on the machine, and a file outlives the run that needed it.
+      const runEnv = agentEnv(apiToken ? { JG_API_TOKEN: apiToken, JG_API_BASE: apiBase } : {});
       return await new Promise((resolve) => {
         let child;
-        try { child = spawn(bin, argv, { cwd, env: agentEnv(), stdio: ['ignore', 'pipe', 'pipe'] }); }
+        try { child = spawn(bin, argv, { cwd, env: runEnv, stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch (e) { return void resolve({ ok: false, error: `failed to start ${bin}: ${e.message}` }); }
         let out = '', err = '', truncated = false, done = false;
         const take = (d, which) => {
