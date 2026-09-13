@@ -1490,9 +1490,18 @@ export function makeEditorCommands({ ws, getWs, version }) {
         .join('\n\n');
       const asked = String(args?.prompt || '').slice(0, 16000);
       if (!asked) throw new Error('agent.run needs a prompt');
+      /* THE WORKSPACE'S OWN STANDING INSTRUCTION, FIRST.
+       *
+       * Set by the tenant's owners — what this organisation calls things, which
+       * figures are authoritative, what the assistant must not do unasked. It
+       * goes at the top so it frames everything after it, and it is carried as
+       * text rather than a --system flag because the flag differs per CLI and
+       * this has to read the same to claude, codex and gemini alike. */
+      const sysP = String(args?.systemPrompt || '').slice(0, 8000).trim();
+      const head = sysP ? `${sysP}\n\n---\n\n` : '';
       const prompt = convo
-        ? `Earlier in this conversation:\n\n${convo}\n\n---\n\nAdmin: ${asked}`
-        : asked;
+        ? `${head}Earlier in this conversation:\n\n${convo}\n\n---\n\nAdmin: ${asked}`
+        : `${head}${asked}`;
       const app = /^[a-z][a-z0-9-]{0,30}$/.test(String(args?.app || '')) ? String(args.app) : null;
 
       /* ADOPT THE CHECKOUT THAT IS ALREADY HERE.
