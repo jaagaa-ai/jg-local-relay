@@ -1470,8 +1470,29 @@ export function makeEditorCommands({ ws, getWs, version }) {
      * a wall-clock timeout, and a cap on how much output is carried back.
      */
     'agent.run': async (args) => {
-      const prompt = String(args?.prompt || '').slice(0, 16000);
-      if (!prompt) throw new Error('agent.run needs a prompt');
+      /* THE CONVERSATION COMES FROM THE BROWSER, NOT FROM A CLI SESSION.
+       *
+       * agent.run is a one-shot with no --resume, so every question arrived with
+       * no memory of the last: the transcript on screen looked like a
+       * conversation and the agent had never seen a word of it. "Now show me
+       * their emails" was answered by a process that had no idea who "they"
+       * were.
+       *
+       * Resuming a CLI session would fix continuity and introduce a second
+       * source of truth — the reader's transcript and the agent's would drift
+       * the first time somebody pressed Clear, edited a message, or opened the
+       * panel on another device. What the reader can SEE is the conversation, so
+       * that is what gets sent. Bounded, because a transcript grows without
+       * limit and a prompt does not. */
+      const hist = Array.isArray(args?.history) ? args.history.slice(-12) : [];
+      const convo = hist
+        .map((m) => `${m && m.role === 'assistant' ? 'Assistant' : 'Admin'}: ${String((m && m.text) || '').slice(0, 4000)}`)
+        .join('\n\n');
+      const asked = String(args?.prompt || '').slice(0, 16000);
+      if (!asked) throw new Error('agent.run needs a prompt');
+      const prompt = convo
+        ? `Earlier in this conversation:\n\n${convo}\n\n---\n\nAdmin: ${asked}`
+        : asked;
       const app = /^[a-z][a-z0-9-]{0,30}$/.test(String(args?.app || '')) ? String(args.app) : null;
 
       /* ADOPT THE CHECKOUT THAT IS ALREADY HERE.
@@ -1513,7 +1534,15 @@ export function makeEditorCommands({ ws, getWs, version }) {
       const apiToken = String(args?.apiToken || '').trim();
       if (apiBase && apiToken) {
         const proj = /^[a-z0-9][a-z0-9._-]{0,60}$/i.test(String(args?.project || '')) ? String(args.project) : 'default';
-        const room = path.join(accountRoot(args?.account || declaredOwner()), '.assistant', proj);
+        /* ONE ROOM PER PERSON, NOT PER MACHINE.
+         *
+         * The machine belongs to the org; the QUESTION belongs to whoever asked
+         * it. Two admins asking at the same time would otherwise share a working
+         * directory — one agent's scratch files, and any conversation state
+         * Claude Code keeps for that path, visible to the other. The folder is
+         * not secret, but it is not shared either. */
+        const who = String(args?.askedBy || '').toLowerCase().replace(/[^a-z0-9._@-]/g, '_') || 'shared';
+        const room = path.join(accountRoot(args?.account || declaredOwner()), '.assistant', proj, who);
         try {
           mkdirSync(room, { recursive: true });
           // The brief, rewritten each run so it can never describe a stale
