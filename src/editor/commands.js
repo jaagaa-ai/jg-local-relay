@@ -165,7 +165,7 @@ function killGroup(child) {
 // Which coding CLI drives a chat turn + its argv. Mirrors jg-sandbox-runner's
 // buildAgentRun, but LOCAL: the CLI runs under the user's OWN $HOME, so it uses
 // their real `claude` subscription / config — no XDG sandbox overrides.
-function buildAgentRun({ cli, prompt, convId, convName, resume, started, model }) {
+function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, meter }) {
   switch (cli) {
     case 'codex':  return { bin: 'codex', argv: ['exec', prompt] };
     case 'gemini': return { bin: 'gemini', argv: ['-p', prompt] };
@@ -179,6 +179,18 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model }
     case 'claude':
     default: {
       const a = ['-p', '--dangerously-skip-permissions'];
+      /* ASK IT HOW LONG IT TOOK AND WHY.
+       *
+       * A run reported one number — total seconds — which is the one number
+       * that cannot be acted on: 48 seconds of thinking and 48 seconds of
+       * waiting on the network look identical, and so do six model turns and
+       * sixteen. This format returns duration, API time and TURN COUNT, and
+       * turns are what actually cost: each is a separate round trip to the
+       * model, taken in sequence, and nothing else in the run comes close.
+       *
+       * Only on the one-shot assistant path — the editor's chat streams its
+       * output and would be broken by a format that only lands at the end. */
+      if (meter) a.push('--output-format', 'json');
       // The caller could ASK for a model and was never given one. `model` was
       // threaded all the way down here and then used by opencode alone, so
       // picking one for claude changed nothing and said nothing - the worst
@@ -1718,7 +1730,8 @@ export function makeEditorCommands({ ws, getWs, version }) {
       const model = /^[a-z0-9][a-z0-9._/-]{0,60}$/i.test(String(args?.model || '')) ? String(args.model) : null;
       const timeoutMs = Math.min(Math.max(Number(args?.timeoutMs) || 120000, 1000), 15 * 60 * 1000);
       const maxOut = Math.min(Math.max(Number(args?.maxOutputBytes) || 256 * 1024, 1024), 4 * 1024 * 1024);
-      const { bin, argv } = buildAgentRun({ cli, prompt, convId: null, convName: null, resume: false, started: false, model });
+      const meter = cli === 'claude';
+      const { bin, argv } = buildAgentRun({ cli, prompt, convId: null, convName: null, resume: false, started: false, model, meter });
       const _t0 = Date.now();
       alog(`run ${cli}${model ? ' (' + model + ')' : ''} in ${cwd}` + (apiToken ? ' with an API token' : ' with no API token')
         + ` — ${JSON.stringify(String(asked).slice(0, 120))}`);
@@ -1773,8 +1786,30 @@ export function makeEditorCommands({ ws, getWs, version }) {
            * credential and has nothing to reset. */
           const blob = `${out}\n${err}`.toLowerCase();
           const authy = exitCode !== 0 && /(not logged in|please log ?in|\/login|unauthor|authentication|invalid api key|session (has )?expired|token (has )?expired|credentials)/.test(blob);
+          /* UNWRAP THE METERED FORM, AND SAY WHAT IT COST.
+           *
+           * With --output-format json the answer arrives wrapped alongside the
+           * numbers. The wrapper must not reach the reader — they asked a
+           * question, not for a JSON document — so the text is unwrapped here
+           * and the numbers travel beside it. Anything unparseable falls
+           * through untouched: a metered run that prints something unexpected
+           * must still deliver whatever it did print. */
+          let answer = out, turns = null, apiMs = null;
+          if (meter && out.trim().startsWith('{')) {
+            try {
+              const j = JSON.parse(out);
+              if (typeof j.result === 'string') answer = j.result;
+              if (Number.isFinite(j.num_turns)) turns = j.num_turns;
+              if (Number.isFinite(j.duration_api_ms)) apiMs = j.duration_api_ms;
+            } catch { /* not the shape we asked for; send what it printed */ }
+          }
+          if (turns !== null) {
+            alog(`  metered: ${turns} turns, api ${Math.round((apiMs || 0) / 1000)}s of ${Math.round((Date.now() - _t0) / 1000)}s wall`);
+          }
           resolve({
-            ok: exitCode === 0, exitCode, output: out, stderr: err, truncated, cli, bin,
+            ok: exitCode === 0, exitCode, output: answer, stderr: err, truncated, cli, bin,
+            ...(turns !== null ? { turns } : {}),
+            ...(apiMs !== null ? { apiMs } : {}),
             ...(authy ? {
               authExpired: true,
               error: `${cli} on this machine is not signed in, or its session has expired. `
