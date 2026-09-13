@@ -67,6 +67,29 @@ const BIN_DIRS = [
   path.join(os.homedir(), 'go', 'bin'),
   '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin',
 ];
+/* WHOSE MACHINE IS THIS? The machine already knows.
+ *
+ * allowed-accounts.txt declares `owner=<email>` — written by whoever physically
+ * holds the hardware, and the same file that decides who may drive this relay
+ * at all. So when a task arrives without an account stamped on it, there is a
+ * correct answer sitting on disk, and falling back to it is not a guess.
+ *
+ * It is also the SAFE fallback, which a search would not be: the only account
+ * tree this can reach is the one the machine's own owner declared, never
+ * another account's work on a shared computer.
+ */
+function declaredOwner() {
+  try {
+    const f = path.join(INSTALL_ROOT, 'allowed-accounts.txt');
+    for (const line of readFileSync(f, 'utf8').split('\n')) {
+      const v = line.split('#')[0].trim().toLowerCase();
+      const m = v.match(/^owner\s*[=:]\s*(.+)$/);
+      if (m) return m[1].trim();
+    }
+  } catch { /* no file */ }
+  return (process.env.JG_RELAY_OWNER || '').trim().toLowerCase() || null;
+}
+
 let _agentPath = null;
 function agentPath() {
   if (_agentPath) return _agentPath;
@@ -1470,19 +1493,46 @@ export function makeEditorCommands({ ws, getWs, version }) {
        * request that gives up after two minutes, would produce a timeout and
        * a half-prepared directory. Absent, we say plainly what is missing and
        * how one press fixes it. */
+      const tried = [];
       if (!workspace) {
         const proj = String(args?.project || '').trim();
         if (/^[a-z0-9][a-z0-9._-]{0,60}$/i.test(proj)) {
-          const guess = path.join(accountRoot(args?.account), proj);
-          if (existsSync(path.join(guess, '.git'))) workspace = guess;
+          /* TWO LAYOUTS, BOTH REAL.
+           *
+           * Checkouts live at <root>/<account>/<project>, and at <root>/<project>
+           * on a machine set up before accounts were stamped. Looking only in the
+           * account-scoped place means a task that arrives WITHOUT an account —
+           * because some hop upstream did not send one — searches <root>/<project>,
+           * finds nothing, and reports that the machine has no copy of a project
+           * that is sitting right there one directory down.
+           *
+           * Both are tried. Neither reaches into ANOTHER account's tree: the only
+           * candidates are the account we were told and the flat legacy root. */
+          const roots = [];
+          const push = (r) => { if (r && roots.indexOf(r) < 0) roots.push(r); };
+          if (args?.account) push(accountRoot(args.account));
+          // No account on the task: use the one the MACHINE declares.
+          push(accountRoot(declaredOwner()));
+          push(LOCAL_ROOT);
+          for (const r of roots) {
+            const guess = path.join(r, proj);
+            tried.push(guess);
+            if (existsSync(path.join(guess, '.git'))) { workspace = guess; break; }
+          }
         }
       }
       const cwd = app ? resolveIn(app) : workspace;
       if (!cwd) {
+        /* SAY WHERE WE LOOKED. "No copy of X" is true and unactionable: the
+         * reader cannot tell a missing clone from a task that arrived without
+         * an account and therefore searched the wrong folder — which is a bug
+         * on our side, not something for them to fix by cloning anything. */
         const proj = String(args?.project || '').trim() || 'this project';
+        const where = tried.length ? ` Looked in: ${tried.join(', ')}.` : '';
+        const acct = args?.account ? '' : ' (no account was sent with this task, so the machine\'s declared owner was used instead)';
         throw new Error(
-          `This machine has no copy of ${proj} yet. Open the AI Editor for it once `
-          + `so it can be set up, then ask again.`,
+          `This machine has no copy of ${proj} yet.${where}${acct} `
+          + `Open the AI Editor for it once so it can be set up, then ask again.`,
         );
       }
       const cli = /^(opencode|claude|codex|gemini)$/.test(String(args?.cli || '')) ? String(args.cli) : 'claude';
