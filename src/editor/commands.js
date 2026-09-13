@@ -110,6 +110,12 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model }
     case 'claude':
     default: {
       const a = ['-p', '--dangerously-skip-permissions'];
+      // The caller could ASK for a model and was never given one. `model` was
+      // threaded all the way down here and then used by opencode alone, so
+      // picking one for claude changed nothing and said nothing - the worst
+      // combination, because the UI could offer a choice that quietly did not
+      // happen. Validated upstream against the same narrow pattern as before.
+      if (model) a.push('--model', model);
       if (convId) { if (resume) a.push('--resume', convId); else { a.push('--session-id', convId); if (convName) a.push('--name', convName); } }
       else if (started) a.push('--continue');
       a.push(prompt);
