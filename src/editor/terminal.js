@@ -29,10 +29,13 @@ export class Terminal {
    * While nothing is connected, output accumulates in a bounded buffer and is
    * replayed on attach.
    */
-  constructor({ getWs, ws, id, cwd }) {
+  constructor({ getWs, ws, id, cwd, env }) {
     this.getWs = typeof getWs === 'function' ? getWs : () => ws;
     this.id = id;     // the term.open command id (the browser keys frames on it)
     this.cwd = cwd;   // the project workspace dir
+    // A PTY opened for a CLI sign-in needs the widened PATH the agent runs use,
+    // or it starts a shell that cannot find the very binary it was opened for.
+    this.env = env || null;
     this.pty = null;
     this.buf = [];    // detached output, replayed on attach
     this.bufBytes = 0;
@@ -67,7 +70,7 @@ export class Terminal {
       // workspace, so reaching here with none is a bug worth seeing rather than
       // a shell in the wrong directory that looks like it works.
       cwd: this.cwd,
-      env: { ...process.env, TERM: 'xterm-256color' },
+      env: { ...(this.env || process.env), TERM: 'xterm-256color' },
     });
     this.pty.onData((data) => {
       this.lastUsed = Date.now();

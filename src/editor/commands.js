@@ -981,6 +981,40 @@ export function makeEditorCommands({ ws, getWs, version }) {
       terms.set(ctx.id, t);
       return { opened: true, termId: ctx.id };
     },
+    /* --- signing the CLI in, without becoming an editor ---------------------
+     *
+     * A CLI SIGN-IN NEEDS A TERMINAL, AND ONLY A TERMINAL.
+     *
+     * `claude` authenticates by printing a URL, waiting while a person approves
+     * it in a browser, and reading a code back. There is no headless form of
+     * that, and no amount of API design removes the need for somewhere to paste
+     * the code. Telling an admin to go and find a terminal on the machine is not
+     * an answer when the machine is in another room, or is not theirs, or when
+     * they have never opened one.
+     *
+     * So the Assistant gets a PTY — for THIS and nothing else. Not term.open:
+     * that waits on a workspace the Assistant deliberately does not have, and
+     * offering a general shell is what turns this back into an editor. This one
+     * starts the CLI already running, in the assistant's own empty room, with
+     * the same widened PATH the runs use so it finds a CLI installed under the
+     * home directory.
+     */
+    'agent.signin': async (args, ctx) => {
+      const cli = /^(opencode|claude|codex|gemini)$/.test(String(args?.cli || '')) ? String(args.cli) : 'claude';
+      const proj = /^[a-z0-9][a-z0-9._-]{0,60}$/i.test(String(args?.project || '')) ? String(args.project) : 'default';
+      const who = String(args?.askedBy || '').toLowerCase().replace(/[^a-z0-9._@-]/g, '_') || 'shared';
+      const room = path.join(accountRoot(args?.account || declaredOwner()), '.assistant', proj, who);
+      try { mkdirSync(room, { recursive: true }); } catch { /* falls back below */ }
+      const cwd = existsSync(room) ? room : os.homedir();
+      const wsNow = () => ctx.ws ?? null;
+      const t = new Terminal({ getWs: wsNow, id: ctx.id, cwd, env: agentEnv() });
+      terms.set(ctx.id, t);
+      // Start the CLI immediately: the reader asked to sign in, not for a shell
+      // they then have to know the command for.
+      setTimeout(() => { try { t.input(`${cli}\r`); } catch { /* gone */ } }, 250);
+      return { opened: true, termId: ctx.id, cwd, cli };
+    },
+
     'term.input': async (args) => { pickTerm(args.termId)?.input(args.data); return {}; },
     'term.resize': async (args) => { pickTerm(args.termId)?.resize(args.cols, args.rows); return {}; },
     'term.close': async (args) => { const t = pickTerm(args.termId); if (t) { t.close(); terms.delete(t.id); } return { closed: true }; },
