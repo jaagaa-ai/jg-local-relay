@@ -1006,7 +1006,11 @@ export function makeEditorCommands({ ws, getWs, version }) {
       const room = path.join(accountRoot(args?.account || declaredOwner()), '.assistant', proj, who);
       try { mkdirSync(room, { recursive: true }); } catch { /* falls back below */ }
       const cwd = existsSync(room) ? room : os.homedir();
-      const wsNow = () => ctx.ws ?? null;
+      /* THE SAME SOCKET ACCESSOR term.open USES, and not one invented here.
+       * `ctx.ws` does not exist — a Terminal built with it has no socket, so it
+       * opened, ran, and wrote its output into nothing. A cursor appeared and
+       * never anything else. wsNow is the module-level accessor that survives a
+       * reconnect, which is the whole reason it is a function. */
       const t = new Terminal({ getWs: wsNow, id: ctx.id, cwd, env: agentEnv() });
       terms.set(ctx.id, t);
       // Start the CLI immediately: the reader asked to sign in, not for a shell
