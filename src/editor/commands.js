@@ -1012,6 +1012,10 @@ export function makeEditorCommands({ ws, getWs, version }) {
        * never anything else. wsNow is the module-level accessor that survives a
        * reconnect, which is the whole reason it is a function. */
       const t = new Terminal({ getWs: wsNow, id: ctx.id, cwd, env: agentEnv() });
+      // A Terminal is not a PTY until it is opened. Constructing one and
+      // registering it looks complete and spawns nothing: the panel showed a
+      // cursor because xterm draws one, and there was no process behind it.
+      t.open({ cols: args?.cols, rows: args?.rows });
       terms.set(ctx.id, t);
       // Start the CLI immediately: the reader asked to sign in, not for a shell
       // they then have to know the command for.
