@@ -39,6 +39,52 @@ const accountRoot = (account) => {
 // This relay's stable id — same value sent in the dial-home hello frame, so
 // jg-api can correlate a resource-mint REST call to the live bridged session and
 // refuse minting another account's project (account-isolation backstop).
+/* WHERE THE CLIs ACTUALLY LIVE, WHICH IS NOT ON launchd's PATH.
+ *
+ * A relay started by launchd (or systemd) inherits a minimal environment:
+ * /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin and nothing else. It does NOT
+ * inherit the shell profile, so every tool installed into a user directory is
+ * invisible to it — and that is where these tools install themselves.
+ * `claude` puts its binary in ~/.local/bin; bun, pnpm, cargo, a user-level npm
+ * prefix and nvm all do the same thing in their own folders.
+ *
+ * The failure this caused is a bad one because it looks like something else:
+ * `which claude` finds nothing, so agent.status reports the CLI as NOT
+ * INSTALLED on a machine where it is installed, signed in, and works perfectly
+ * from a terminal. The person is told to install software they already have.
+ * agent.run then fails with a bare ENOENT.
+ *
+ * So the PATH is widened for every lookup and every spawn. Only directories
+ * that EXIST are added, and they go AFTER the inherited ones so a deliberate
+ * system install still wins.
+ */
+const BIN_DIRS = [
+  path.join(os.homedir(), '.local', 'bin'),        // claude's own installer
+  path.join(os.homedir(), '.bun', 'bin'),
+  path.join(os.homedir(), '.deno', 'bin'),
+  path.join(os.homedir(), '.cargo', 'bin'),
+  path.join(os.homedir(), '.npm-global', 'bin'),
+  path.join(os.homedir(), 'go', 'bin'),
+  '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin',
+];
+let _agentPath = null;
+function agentPath() {
+  if (_agentPath) return _agentPath;
+  const seen = new Set();
+  const parts = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  for (const d of parts) seen.add(d);
+  for (const d of BIN_DIRS) {
+    if (seen.has(d)) continue;
+    try { if (existsSync(d)) { parts.push(d); seen.add(d); } } catch { /* unreadable */ }
+  }
+  _agentPath = parts.join(path.delimiter);
+  return _agentPath;
+}
+/** The env a CLI is looked up and run with. */
+function agentEnv(extra) {
+  return { ...process.env, ...(extra || {}), PATH: agentPath() };
+}
+
 const RELAY_ID = process.env.JG_RELAY_ID || os.hostname();
 // Where the relay itself is installed (…/src/editor/commands.js → …/). The build
 // stamp self-update writes lives here.
@@ -1324,12 +1370,12 @@ export function makeEditorCommands({ ws, getWs, version }) {
      */
     'agent.status': async () => {
       const which = (bin) => new Promise((res) => {
-        execFile(process.platform === 'win32' ? 'where' : 'which', [bin], { timeout: 4000 }, (err, out) => {
+        execFile(process.platform === 'win32' ? 'where' : 'which', [bin], { timeout: 4000, env: agentEnv() }, (err, out) => {
           res(err ? null : String(out).split('\n')[0].trim() || null);
         });
       });
       const version = (bin) => new Promise((res) => {
-        execFile(bin, ['--version'], { timeout: 6000 }, (err, out) => {
+        execFile(bin, ['--version'], { timeout: 6000, env: agentEnv() }, (err, out) => {
           res(err ? null : String(out).trim().split('\n')[0].slice(0, 60) || null);
         });
       });
@@ -1446,7 +1492,7 @@ export function makeEditorCommands({ ws, getWs, version }) {
       const { bin, argv } = buildAgentRun({ cli, prompt, convId: null, convName: null, resume: false, started: false, model });
       return await new Promise((resolve) => {
         let child;
-        try { child = spawn(bin, argv, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        try { child = spawn(bin, argv, { cwd, env: agentEnv(), stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch (e) { return void resolve({ ok: false, error: `failed to start ${bin}: ${e.message}` }); }
         let out = '', err = '', truncated = false, done = false;
         const take = (d, which) => {
@@ -1493,7 +1539,7 @@ export function makeEditorCommands({ ws, getWs, version }) {
       const { bin, argv } = buildAgentRun({ cli, prompt, convId, convName, resume: started, started, model });
       return await new Promise((resolve) => {
         let child;
-        try { child = spawn(bin, argv, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        try { child = spawn(bin, argv, { cwd, env: agentEnv(), stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch (e) { ctx.send({ type: 'agent-data', id: ctx.id, stream: 'stderr', data: Buffer.from(`failed to start ${bin}: ${e.message}`, 'utf8').toString('base64') }); return resolve({ ok: false }); }
         let sawOut = false;
         const stream = (s) => (d) => { if (s === 'stdout') sawOut = true; ctx.send({ type: 'agent-data', id: ctx.id, stream: s, data: Buffer.from(d).toString('base64') }); };
