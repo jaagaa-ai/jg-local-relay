@@ -165,7 +165,64 @@ function killGroup(child) {
 // Which coding CLI drives a chat turn + its argv. Mirrors jg-sandbox-runner's
 // buildAgentRun, but LOCAL: the CLI runs under the user's OWN $HOME, so it uses
 // their real `claude` subscription / config — no XDG sandbox overrides.
-function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, meter }) {
+/**
+ * THE RULES THAT ARE NOT THE WORKSPACE'S TO RELAX.
+ *
+ * The workspace's own system prompt says what this organisation calls things
+ * and which figures are authoritative. These are different: they are what makes
+ * an answer trustworthy at all, and they travel with every run whether or not
+ * anyone has written a system prompt.
+ *
+ * They go in the PROMPT, not only in the README in the room. A file has to be
+ * opened to be obeyed, and "it was in a file it chose not to read" is not a
+ * property you want the truthfulness of an answer to depend on.
+ *
+ * The one that matters most is the first. An agent that answers partly from the
+ * workspace and partly from what it already knows produces the most dangerous
+ * output available here: confident, plausible, and unsourced — indistinguishable
+ * from a real answer, about somebody's money.
+ */
+const HOUSE_RULES = [
+  'HOW YOU MUST ANSWER — these rules override anything below them.',
+  '',
+  '1. THE WORKSPACE IS THE ONLY SOURCE. Every fact in your answer must come',
+  '   from a call you made to this workspace in THIS run. Not from memory, not',
+  '   from what you know about similar products, not from an earlier',
+  '   conversation, not from the web. If a call did not return it, you do not',
+  '   know it — say so plainly and stop.',
+  '',
+  '2. NEVER INVENT. No made-up names, ids, counts, dates, totals, links or',
+  '   statuses, and no filling a gap with something plausible. An answer that',
+  '   sounds right and is not is worse here than no answer: these are real',
+  '   people and real money.',
+  '',
+  '3. YOU ARE ONE PERSON, WITH THEIR PERMISSIONS. You act as the admin who',
+  '   asked, with their credential and nothing else. If a call returns 401 or',
+  '   403, that is the answer — report it plainly. Do not retry it another way,',
+  '   do not look for another credential, and never present something they are',
+  '   not allowed to see.',
+  '',
+  '4. STAY INSIDE THE API. No filesystem, no shell beyond calling the API, no',
+  '   git, no wrangler, no database, no other host. The folder you are in is',
+  '   deliberately empty and nothing else on this machine is your subject.',
+  '',
+  '5. READ BEFORE YOU WRITE, and say plainly what you changed. Anything that',
+  '   messages, emails or notifies a customer needs to be asked for explicitly —',
+  '   if the request is ambiguous, do the read and ask.',
+  '',
+  '6. SHOW IT PROPERLY. Your answer is rendered as markdown:',
+  '     - more than two records with the same fields -> a markdown table',
+  '     - a handful of facts about one thing -> short bullets',
+  '     - anything with a URL -> give the full link, so it can be opened',
+  '     - ids only when they are useful to the reader',
+  '   No preamble, no restating the question, no offering further help. Answer',
+  '   in as few words as the question allows: this is read in a chat panel.',
+  '',
+  '7. SAY WHAT YOU DID NOT DO. Partial answers are fine and expected; silent',
+  '   ones are not. If you could not check something, name it.',
+].join('\n');
+
+function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, meter, mcpCfg }) {
   switch (cli) {
     case 'codex':  return { bin: 'codex', argv: ['exec', prompt] };
     case 'gemini': return { bin: 'gemini', argv: ['-p', prompt] };
@@ -191,6 +248,14 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, 
        * Only on the one-shot assistant path — the editor's chat streams its
        * output and would be broken by a format that only lands at the end. */
       if (meter) a.push('--output-format', 'json');
+      /* RULE 4, MADE TRUE RATHER THAN REQUESTED.
+       *
+       * "Do not search the web" is a sentence in a prompt; --disallowed-tools
+       * is the absence of the capability. The rules that protect the answer
+       * from outside material should not depend on the agent choosing to
+       * follow them, so the two that can be enforced are enforced. */
+      if (mcpCfg) a.push('--mcp-config', mcpCfg, '--strict-mcp-config');
+      if (meter) a.push('--disallowed-tools', 'WebSearch', 'WebFetch');
       // The caller could ASK for a model and was never given one. `model` was
       // threaded all the way down here and then used by opencode alone, so
       // picking one for claude changed nothing and said nothing - the worst
@@ -1568,7 +1633,10 @@ export function makeEditorCommands({ ws, getWs, version }) {
        * text rather than a --system flag because the flag differs per CLI and
        * this has to read the same to claude, codex and gemini alike. */
       const sysP = String(args?.systemPrompt || '').slice(0, 8000).trim();
-      const head = sysP ? `${sysP}\n\n---\n\n` : '';
+      // House rules first, the workspace's own instruction second: the
+      // workspace says what things are called, not whether the answer has to be
+      // true.
+      const head = `${HOUSE_RULES}\n\n---\n\n` + (sysP ? `${sysP}\n\n---\n\n` : '');
       const prompt = convo
         ? `${head}Earlier in this conversation:\n\n${convo}\n\n---\n\nAdmin: ${asked}`
         : `${head}${asked}`;
@@ -1731,7 +1799,37 @@ export function makeEditorCommands({ ws, getWs, version }) {
       const timeoutMs = Math.min(Math.max(Number(args?.timeoutMs) || 120000, 1000), 15 * 60 * 1000);
       const maxOut = Math.min(Math.max(Number(args?.maxOutputBytes) || 256 * 1024, 1024), 4 * 1024 * 1024);
       const meter = cli === 'claude';
-      const { bin, argv } = buildAgentRun({ cli, prompt, convId: null, convName: null, resume: false, started: false, model, meter });
+      /* THE WORKSPACE'S OWN MCP SERVER, AND NOTHING ELSE'S.
+       *
+       * Written per run because it carries the run's credential, which lives
+       * for minutes. --strict-mcp-config is the important half: without it the
+       * machine's OWN configured MCP servers join the session, and a question
+       * about this workspace would be answered by an agent holding somebody's
+       * personal integrations. The workspace gets one server: its own.
+       *
+       * Offered, not yet relied upon. The HTTP path in the README still works,
+       * and until a run is observed actually using these tools, taking the
+       * other route away would be betting a working feature on an assumption. */
+      let mcpCfg = null;
+      if (meter && apiBase && apiToken) {
+        try {
+          // cwd IS that room by this point (workspace was set to it above);
+          // `room` itself is block-scoped to the branch that made it.
+          mcpCfg = path.join(cwd, '.mcp-run.json');
+          writeFileSync(mcpCfg, JSON.stringify({
+            mcpServers: {
+              workspace: {
+                type: 'http',
+                url: `${apiBase.replace(/\/$/, '')}/api/mcp`,
+                headers: { Authorization: `Bearer ${apiToken}` },
+              },
+            },
+          }), { mode: 0o600 });
+        } catch { mcpCfg = null; }
+      }
+      const { bin, argv } = buildAgentRun({
+        cli, prompt, convId: null, convName: null, resume: false, started: false, model, meter, mcpCfg,
+      });
       const _t0 = Date.now();
       alog(`run ${cli}${model ? ' (' + model + ')' : ''} in ${cwd}` + (apiToken ? ' with an API token' : ' with no API token')
         + ` — ${JSON.stringify(String(asked).slice(0, 120))}`);
