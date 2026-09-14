@@ -247,7 +247,14 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, 
        *
        * Only on the one-shot assistant path — the editor's chat streams its
        * output and would be broken by a format that only lands at the end. */
-      if (meter) a.push('--output-format', 'json');
+      /* THE SAME RUN, NARRATED.
+       * `json` returned one object at the end — the numbers, and nothing while
+       * it worked, so three minutes of real work looked identical to three
+       * minutes of being stuck. `stream-json` emits a line per event as it
+       * happens and still carries the final result object, so this costs
+       * nothing and buys the whole middle of the run. --verbose is required
+       * for it to emit anything at all under -p. */
+      if (meter) a.push('--output-format', 'stream-json', '--verbose');
       /* RULE 4, MADE TRUE RATHER THAN REQUESTED.
        *
        * "Do not search the web" is a sentence in a prompt; --disallowed-tools
@@ -1842,9 +1849,79 @@ export function makeEditorCommands({ ws, getWs, version }) {
         try { child = spawn(bin, argv, { cwd, env: runEnv, stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch (e) { return void resolve({ ok: false, error: `failed to start ${bin}: ${e.message}` }); }
         let out = '', err = '', truncated = false, done = false;
+        /* WHAT IT IS DOING, WHILE IT DOES IT.
+         *
+         * stream-json is newline-delimited, and a chunk boundary lands mid-line
+         * often enough that parsing per chunk would silently drop events. The
+         * tail is carried between chunks and only whole lines are parsed.
+         *
+         * Sent in small batches rather than per line: a run makes hundreds of
+         * events, and a frame each would be more traffic than the answer. */
+        let tail = '', batch = [], flushTimer = null;
+        const told = [];
+        /* WHICH MODEL ACTUALLY ANSWERED.
+         * The request may name one, or name none and take the machine's
+         * default — and the UI was showing "machine default", which is a
+         * setting, not an answer. Every assistant event carries the real one,
+         * so it is read from the run rather than assumed from the request. */
+        let usedModel = null;
+        const flush = () => {
+          flushTimer = null;
+          if (!batch.length) return;
+          const steps = batch; batch = [];
+          try { ctx.send({ type: 'progress', id: ctx.id, steps }); } catch { /* the run matters more */ }
+        };
+        const step = (kind, text) => {
+          if (!text) return;
+          const line = String(text).slice(0, 300);
+          batch.push({ at: Date.now(), kind, text: line });
+          if (told.length < 200) told.push(`${kind}: ${line}`);
+          if (!flushTimer) { flushTimer = setTimeout(flush, 400); flushTimer.unref?.(); }
+        };
+        /** One readable line per event. The reader wants "what is it doing",
+         *  not the wire format. */
+        const narrate = (ev) => {
+          if (!ev || typeof ev !== 'object') return;
+          if (ev.type === 'assistant' && ev.message && !usedModel && ev.message.model) usedModel = String(ev.message.model);
+          if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
+            for (const c of ev.message.content) {
+              if (c.type === 'tool_use') {
+                const inp = c.input || {};
+                // The API call itself is the interesting part of an API task.
+                const what = inp.url || inp.path || inp.command || inp.file_path || inp.pattern || '';
+                step('tool', what ? `${c.name} — ${String(what).slice(0, 200)}` : String(c.name));
+              } else if (c.type === 'text' && c.text && c.text.trim()) {
+                step('think', c.text.trim());
+              }
+            }
+          } else if (ev.type === 'user' && ev.message && Array.isArray(ev.message.content)) {
+            for (const c of ev.message.content) {
+              if (c.type !== 'tool_result') continue;
+              const body = typeof c.content === 'string'
+                ? c.content
+                : Array.isArray(c.content) ? c.content.map((x) => x?.text || '').join(' ') : '';
+              step(c.is_error ? 'error' : 'result', String(body).replace(/\s+/g, ' ').trim().slice(0, 200));
+            }
+          }
+        };
         const take = (d, which) => {
           const t = d.toString('utf8');
           if (which === 'out') {
+            if (meter) {
+              tail += t;
+              let nl;
+              while ((nl = tail.indexOf('\n')) >= 0) {
+                const line = tail.slice(0, nl).trim();
+                tail = tail.slice(nl + 1);
+                if (!line) continue;
+                let ev = null;
+                try { ev = JSON.parse(line); } catch { continue; }
+                narrate(ev);
+                // The final result object is the one worth keeping whole.
+                if (ev && ev.type === 'result') out = line;
+              }
+              return;
+            }
             if (out.length + t.length > maxOut) { out += t.slice(0, Math.max(0, maxOut - out.length)); truncated = true; }
             else out += t;
           } else if (err.length < 8192) err += t.slice(0, 8192 - err.length);
@@ -1859,7 +1936,16 @@ export function makeEditorCommands({ ws, getWs, version }) {
           try { child.kill('SIGKILL'); } catch { /* gone */ }
           done = true;
           alog(`TIMED OUT after ${Math.round(timeoutMs / 1000)}s — killed; out=${out.length}b err=${err.length}b`);
-          resolve({ ok: false, error: `timed out after ${timeoutMs}ms`, timedOut: true, output: out, stderr: err, truncated });
+          /* A KILLED RUN STILL HAS SOMETHING TO SAY.
+           * Under stream-json `out` only fills on the final event, so a run
+           * killed mid-flight would have returned an empty string where it used
+           * to return partial stdout. The narration is what it actually got
+           * through, which is the most useful thing left. */
+          clearTimeout(flushTimer); flush();
+          const partial = out || (told.length
+            ? `Stopped before finishing. What it had done:\n\n${told.map((x) => `- ${x}`).join('\n')}`
+            : '');
+          resolve({ ok: false, error: `timed out after ${timeoutMs}ms`, timedOut: true, output: partial, stderr: err, truncated });
         }, timeoutMs);
         timer.unref?.();
         child.on('error', (e) => {
@@ -1869,6 +1955,8 @@ export function makeEditorCommands({ ws, getWs, version }) {
         });
         child.on('close', (exitCode) => {
           if (done) return; done = true; clearTimeout(timer);
+          // Anything narrated in the last few hundred ms still belongs to the run.
+          clearTimeout(flushTimer); flush();
           alog(`done exit=${exitCode} in ${Math.round((Date.now() - _t0) / 1000)}s`
             + ` out=${out.length}b err=${err.length}b${truncated ? ' (truncated)' : ''}`);
           /* A CREDENTIAL THAT EXISTS IS NOT A CREDENTIAL THAT WORKS.
@@ -1908,6 +1996,7 @@ export function makeEditorCommands({ ws, getWs, version }) {
             ok: exitCode === 0, exitCode, output: answer, stderr: err, truncated, cli, bin,
             ...(turns !== null ? { turns } : {}),
             ...(apiMs !== null ? { apiMs } : {}),
+            ...(usedModel ? { usedModel } : {}),
             ...(authy ? {
               authExpired: true,
               error: `${cli} on this machine is not signed in, or its session has expired. `
