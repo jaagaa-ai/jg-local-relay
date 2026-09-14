@@ -262,6 +262,18 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, 
        * from outside material should not depend on the agent choosing to
        * follow them, so the two that can be enforced are enforced. */
       if (mcpCfg) a.push('--mcp-config', mcpCfg, '--strict-mcp-config');
+      /* VARIADIC FLAGS EAT WHATEVER FOLLOWS THEM.
+       *
+       * `--disallowed-tools <tools...>` takes a LIST, so it swallowed the
+       * prompt that came after it as a third tool name — and the CLI then
+       * refused the run with "Input must be provided either through stdin or as
+       * a prompt argument", which is true and says nothing about the cause.
+       * Every question failed.
+       *
+       * The prompt goes on STDIN instead of being a positional argument. It
+       * cannot be captured by any flag, it has no length limit to trip over,
+       * and it stops the whole question being visible in `ps` to every process
+       * on the machine — which it should never have been. */
       if (meter) a.push('--disallowed-tools', 'WebSearch', 'WebFetch');
       // The caller could ASK for a model and was never given one. `model` was
       // threaded all the way down here and then used by opencode alone, so
@@ -271,6 +283,7 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, 
       if (model) a.push('--model', model);
       if (convId) { if (resume) a.push('--resume', convId); else { a.push('--session-id', convId); if (convName) a.push('--name', convName); } }
       else if (started) a.push('--continue');
+      if (meter) return { bin: 'claude', argv: a, stdin: prompt };
       a.push(prompt);
       return { bin: 'claude', argv: a };
     }
@@ -1834,7 +1847,7 @@ export function makeEditorCommands({ ws, getWs, version }) {
           }), { mode: 0o600 });
         } catch { mcpCfg = null; }
       }
-      const { bin, argv } = buildAgentRun({
+      const { bin, argv, stdin } = buildAgentRun({
         cli, prompt, convId: null, convName: null, resume: false, started: false, model, meter, mcpCfg,
       });
       const _t0 = Date.now();
@@ -1846,8 +1859,14 @@ export function makeEditorCommands({ ws, getWs, version }) {
       const runEnv = agentEnv(apiToken ? { JG_API_TOKEN: apiToken, JG_API_BASE: apiBase } : {});
       return await new Promise((resolve) => {
         let child;
-        try { child = spawn(bin, argv, { cwd, env: runEnv, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        try { child = spawn(bin, argv, { cwd, env: runEnv, stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] }); }
         catch (e) { return void resolve({ ok: false, error: `failed to start ${bin}: ${e.message}` }); }
+        if (stdin) {
+          // Closed immediately: -p reads until EOF and would otherwise wait for
+          // input that is never coming.
+          try { child.stdin.write(stdin); child.stdin.end(); }
+          catch (e) { return void resolve({ ok: false, error: `could not send the question: ${e.message}` }); }
+        }
         let out = '', err = '', truncated = false, done = false;
         /* WHAT IT IS DOING, WHILE IT DOES IT.
          *
