@@ -8,6 +8,7 @@
 // git.changes/repo.status/repo.push. preview.*, site.*, agent.* are stubbed
 // with explicit "not wired yet" errors (M3/M4) so the surface is discoverable.
 
+import { makeNarrator } from './narrate.js';
 import os from 'node:os';
 import path from 'node:path';
 import https from 'node:https';
@@ -222,7 +223,7 @@ const HOUSE_RULES = [
   '   ones are not. If you could not check something, name it.',
 ].join('\n');
 
-function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, meter, mcpCfg }) {
+function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, meter, mcpCfg, effort }) {
   switch (cli) {
     case 'codex':  return { bin: 'codex', argv: ['exec', prompt] };
     case 'gemini': return { bin: 'gemini', argv: ['-p', prompt] };
@@ -255,6 +256,16 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, 
        * nothing and buys the whole middle of the run. --verbose is required
        * for it to emit anything at all under -p. */
       if (meter) a.push('--output-format', 'stream-json', '--verbose');
+      /* AND THE MIDDLE OF EACH TURN, NOT JUST ITS END.
+       * stream-json alone reports a turn once the model has finished it: a
+       * whole minute of thinking arrives as one line, after the fact. With
+       * partial messages the thinking and the answer come a few tokens at a
+       * time, and the reader watches the run rather than a step count. */
+      if (meter) a.push('--include-partial-messages');
+      /* HOW HARD TO THINK. Most of a run is model time, and most of that is
+       * reasoning; the CLI takes a level for it. Sent only when the reader
+       * chose one — the machine's default is the default. */
+      if (meter && effort) a.push('--effort', effort);
       /* RULE 4, MADE TRUE RATHER THAN REQUESTED.
        *
        * "Do not search the web" is a sentence in a prompt; --disallowed-tools
@@ -1857,6 +1868,7 @@ export function makeEditorCommands({ ws, getWs, version }) {
       }
       const cli = /^(opencode|claude|codex|gemini)$/.test(String(args?.cli || '')) ? String(args.cli) : 'claude';
       const model = /^[a-z0-9][a-z0-9._/-]{0,60}$/i.test(String(args?.model || '')) ? String(args.model) : null;
+      const effort = /^(low|medium|high|max)$/.test(String(args?.effort || '')) ? String(args.effort) : null;
       const timeoutMs = Math.min(Math.max(Number(args?.timeoutMs) || 120000, 1000), 15 * 60 * 1000);
       const maxOut = Math.min(Math.max(Number(args?.maxOutputBytes) || 256 * 1024, 1024), 4 * 1024 * 1024);
       const meter = cli === 'claude';
@@ -1889,10 +1901,10 @@ export function makeEditorCommands({ ws, getWs, version }) {
         } catch { mcpCfg = null; }
       }
       const { bin, argv, stdin } = buildAgentRun({
-        cli, prompt, convId: null, convName: null, resume: false, started: false, model, meter, mcpCfg,
+        cli, prompt, convId: null, convName: null, resume: false, started: false, model, meter, mcpCfg, effort,
       });
       const _t0 = Date.now();
-      alog(`run ${cli}${model ? ' (' + model + ')' : ''} in ${cwd}` + (apiToken ? ' with an API token' : ' with no API token')
+      alog(`run ${cli}${model ? ' (' + model + ')' : ''}${effort ? ' effort=' + effort : ''} in ${cwd}` + (apiToken ? ' with an API token' : ' with no API token')
         + ` — ${JSON.stringify(String(asked).slice(0, 120))}`);
       // The credential reaches the agent through the ENVIRONMENT and nowhere
       // else: not a file, not an argument. Arguments are visible in `ps` to
@@ -1931,39 +1943,36 @@ export function makeEditorCommands({ ws, getWs, version }) {
           const steps = batch; batch = [];
           try { ctx.send({ type: 'progress', id: ctx.id, steps }); } catch { /* the run matters more */ }
         };
-        const step = (kind, text) => {
+        /* WHAT IT HAS SAID SO FAR — the answer as it is being written. When a
+         * run is killed for time, this is a better thing to hand back than a
+         * list of what it did: it is the reader's answer, up to the point it
+         * stopped. */
+        let said = '';
+        const step = (kind, text, block) => {
           if (!text) return;
-          const line = String(text).slice(0, 300);
-          batch.push({ at: Date.now(), kind, text: line });
-          if (told.length < 200) told.push(`${kind}: ${line}`);
-          if (!flushTimer) { flushTimer = setTimeout(flush, 400); flushTimer.unref?.(); }
+          const delta = kind === 'thinking' || kind === 'say';
+          /* A DELTA IS A FEW TOKENS. Hundreds arrive a second; each one as its
+           * own step would be more frames than words. Consecutive deltas of one
+           * block are joined inside the batch, so a batch carries one growing
+           * step per block rather than a hundred fragments of it. The reader's
+           * side joins across batches by the block number. */
+          if (delta) {
+            const t = String(text);
+            if (kind === 'say' && said.length < 8000) said += t.slice(0, 8000 - said.length);
+            const last = batch[batch.length - 1];
+            if (last && last.block === block && last.kind === kind && last.text.length + t.length <= 1500) { last.text += t; }
+            else batch.push({ at: Date.now(), kind, text: t.slice(0, 1500), block });
+          } else {
+            const line = String(text).slice(0, 300);
+            batch.push({ at: Date.now(), kind, text: line });
+            if (told.length < 200) told.push(`${kind}: ${line}`);
+          }
+          if (!flushTimer) { flushTimer = setTimeout(flush, 250); flushTimer.unref?.(); }
         };
         /** One readable line per event. The reader wants "what is it doing",
          *  not the wire format. */
-        const narrate = (ev) => {
-          if (!ev || typeof ev !== 'object') return;
-          if (ev.type === 'assistant' && ev.message && !usedModel && ev.message.model) usedModel = String(ev.message.model);
-          if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
-            for (const c of ev.message.content) {
-              if (c.type === 'tool_use') {
-                const inp = c.input || {};
-                // The API call itself is the interesting part of an API task.
-                const what = inp.url || inp.path || inp.command || inp.file_path || inp.pattern || '';
-                step('tool', what ? `${c.name} — ${String(what).slice(0, 200)}` : String(c.name));
-              } else if (c.type === 'text' && c.text && c.text.trim()) {
-                step('think', c.text.trim());
-              }
-            }
-          } else if (ev.type === 'user' && ev.message && Array.isArray(ev.message.content)) {
-            for (const c of ev.message.content) {
-              if (c.type !== 'tool_result') continue;
-              const body = typeof c.content === 'string'
-                ? c.content
-                : Array.isArray(c.content) ? c.content.map((x) => x?.text || '').join(' ') : '';
-              step(c.is_error ? 'error' : 'result', String(body).replace(/\s+/g, ' ').trim().slice(0, 200));
-            }
-          }
-        };
+        const narrator = makeNarrator(step);
+        const narrate = (ev) => { narrator.narrate(ev); if (!usedModel) usedModel = narrator.model(); };
         const take = (d, which) => {
           const t = d.toString('utf8');
           if (which === 'out') {
@@ -2002,9 +2011,11 @@ export function makeEditorCommands({ ws, getWs, version }) {
            * to return partial stdout. The narration is what it actually got
            * through, which is the most useful thing left. */
           clearTimeout(flushTimer); flush();
-          const partial = out || (told.length
-            ? `Stopped before finishing. What it had done:\n\n${told.map((x) => `- ${x}`).join('\n')}`
-            : '');
+          const partial = out || (said.trim()
+            ? `${said.trim()}\n\n— stopped here: the run ran out of time before it finished.`
+            : told.length
+              ? `Stopped before finishing. What it had done:\n\n${told.map((x) => `- ${x}`).join('\n')}`
+              : '');
           resolve({ ok: false, error: `timed out after ${timeoutMs}ms`, timedOut: true, output: partial, stderr: err, truncated });
         }, timeoutMs);
         timer.unref?.();
