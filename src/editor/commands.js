@@ -1671,7 +1671,12 @@ export function makeEditorCommands({ ws, getWs, version }) {
      * Bounded on both axes, because the caller is a program and programs retry:
      * a wall-clock timeout, and a cap on how much output is carried back.
      */
-    'agent.run': async (args) => {
+    /* (args, ctx) - THE SECOND ARGUMENT IS THE WHOLE STREAM. This was written
+     * (args) alone, so every ctx.send() of a progress batch threw a
+     * ReferenceError into the catch meant for a dead socket, and not one frame
+     * ever left this process. The log said "first progress after 3s"; the
+     * control plane counted zero. Guarded in test/narrate.mjs. */
+    'agent.run': async (args, ctx) => {
       /* THE CONVERSATION COMES FROM THE BROWSER, NOT FROM A CLI SESSION.
        *
        * agent.run is a one-shot with no --resume, so every question arrived with
