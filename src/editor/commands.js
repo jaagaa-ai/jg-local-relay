@@ -204,9 +204,12 @@ const HOUSE_RULES = [
   '   do not look for another credential, and never present something they are',
   '   not allowed to see.',
   '',
-  '4. STAY INSIDE THE API. No filesystem, no shell beyond calling the API, no',
-  '   git, no wrangler, no database, no other host. The folder you are in is',
-  '   deliberately empty and nothing else on this machine is your subject.',
+  '4. STAY INSIDE THE API. No git, no wrangler, no database, no other host,',
+  '   nothing on this machine outside the folder you are in. That folder is',
+  '   yours to work in when a task needs a file - download it through the API,',
+  '   change it there, upload it back through the API - and it is empty on',
+  '   purpose: nothing else here is your subject. The tools you do not have',
+  '   are not missing; they are withheld.',
   '',
   '5. READ BEFORE YOU WRITE, and say plainly what you changed. Anything that',
   '   messages, emails or notifies a customer needs to be asked for explicitly —',
@@ -237,7 +240,14 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, 
     }
     case 'claude':
     default: {
-      const a = ['-p', '--dangerously-skip-permissions'];
+      /* NO BLANKET BYPASS ON A METERED RUN. --dangerously-skip-permissions
+       * made rule 4 ("stay inside the API") a sentence: the run had the whole
+       * shell and the whole disk, and used them. Now the run is told what it
+       * MAY do - the workspace MCP, curl, and file work inside its own empty
+       * folder - and what it may NEVER do, and the CLI enforces both; a deny
+       * beats anything the model tries. The editor's own chat keeps the bypass:
+       * that is a person at a keyboard, on their own machine, by choice. */
+      const a = meter ? ['-p'] : ['-p', '--dangerously-skip-permissions'];
       /* ASK IT HOW LONG IT TOOK AND WHY.
        *
        * A run reported one number — total seconds — which is the one number
@@ -294,7 +304,18 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, 
        * cannot be captured by any flag, it has no length limit to trip over,
        * and it stops the whole question being visible in `ps` to every process
        * on the machine — which it should never have been. */
-      if (meter) a.push('--disallowed-tools', 'WebSearch', 'WebFetch');
+      if (meter) {
+        a.push('--allowedTools',
+          'mcp__workspace__*',
+          'Bash(curl *)', 'Bash(python3 *)', 'Bash(qpdf *)', 'Bash(jq *)', 'Bash(ls *)', 'Bash(cat *)', 'Bash(head *)', 'Bash(wc *)',
+          'Read(./**)', 'Write(./**)', 'Edit(./**)');
+        a.push('--disallowed-tools',
+          'WebSearch', 'WebFetch',
+          'Bash(rm *)', 'Bash(sudo *)', 'Bash(git *)', 'Bash(wrangler *)', 'Bash(npx *)', 'Bash(npm *)',
+          'Bash(ssh *)', 'Bash(scp *)', 'Bash(psql *)', 'Bash(launchctl *)', 'Bash(kill *)', 'Bash(killall *)', 'Bash(pkill *)',
+          'Bash(chmod *)', 'Bash(chown *)', 'Bash(mv *)', 'Bash(dd *)', 'Bash(open *)', 'Bash(osascript *)',
+          'Bash(security *)', 'Bash(defaults *)', 'Bash(crontab *)', 'Bash(brew *)');
+      }
       // The caller could ASK for a model and was never given one. `model` was
       // threaded all the way down here and then used by opencode alone, so
       // picking one for claude changed nothing and said nothing - the worst
