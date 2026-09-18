@@ -244,14 +244,14 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, 
     }
     case 'claude':
     default: {
-      /* NO BLANKET BYPASS ON A METERED RUN. --dangerously-skip-permissions
-       * made rule 4 ("stay inside the API") a sentence: the run had the whole
-       * shell and the whole disk, and used them. Now the run is told what it
-       * MAY do - the workspace MCP, curl, and file work inside its own empty
-       * folder - and what it may NEVER do, and the CLI enforces both; a deny
-       * beats anything the model tries. The editor's own chat keeps the bypass:
-       * that is a person at a keyboard, on their own machine, by choice. */
-      const a = meter ? ['-p'] : ['-p', '--dangerously-skip-permissions'];
+      /* THE BYPASS STAYS; THE DENY LIST IS THE FENCE. Without the bypass the
+       * CLI refuses any shell command that expands a variable ("Contains
+       * simple_expansion") - and every API call in the brief sends
+       * $JG_API_TOKEN, so the one thing the Assistant exists to do was refused
+       * and a question sat for five minutes (2026-09-18). Measured: under the
+       * bypass a --disallowed-tools rule still refuses (rm was denied, the file
+       * survived), so the fence below is enforced, not requested. */
+      const a = ['-p', '--dangerously-skip-permissions'];
       /* ASK IT HOW LONG IT TOOK AND WHY.
        *
        * A run reported one number — total seconds — which is the one number
@@ -309,10 +309,6 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, 
        * and it stops the whole question being visible in `ps` to every process
        * on the machine — which it should never have been. */
       if (meter) {
-        a.push('--allowedTools',
-          'mcp__workspace__*',
-          'Bash(curl *)', 'Bash(python3 *)', 'Bash(qpdf *)', 'Bash(jq *)', 'Bash(ls *)', 'Bash(cat *)', 'Bash(head *)', 'Bash(wc *)',
-          'Read(./**)', 'Write(./**)', 'Edit(./**)');
         a.push('--disallowed-tools',
           'WebSearch', 'WebFetch',
           'Bash(rm *)', 'Bash(sudo *)', 'Bash(git *)', 'Bash(wrangler *)', 'Bash(npx *)', 'Bash(npm *)',
@@ -1637,7 +1633,7 @@ export function makeEditorCommands({ ws, getWs, version }) {
       try {
         installed = JSON.parse(readFileSync(path.join(APP_ROOT, 'package.json'), 'utf8')).version ?? null;
       } catch { /* running from a checkout without one */ }
-      return { version: installed, pid: process.pid, node: process.version, platform: process.platform, uptimeSec: Math.round(process.uptime()) };
+      return { house_rules: HOUSE_RULES, version: installed, pid: process.pid, node: process.version, platform: process.platform, uptimeSec: Math.round(process.uptime()) };
     },
     'relay.update': async () => {
       // Returns BEFORE the swap can happen: a successful update exits this

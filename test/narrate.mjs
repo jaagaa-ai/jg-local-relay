@@ -74,8 +74,8 @@ is('the owner\'s own skills, commands and hooks stay out of the run', /a\.push\(
 is('the log says when the first progress frame left', /first progress after/.test(src), true);
 is('agent.run receives the context its progress frames are sent through', /'agent\.run': async \(args, ctx\) => \{/.test(src), true);
 is('  and nothing in it sends without one', !/'agent\.run': async \(args\) =>/.test(src), true);
-is('a metered run has no blanket permission bypass', /const a = meter \? \['-p'\] : \['-p', '--dangerously-skip-permissions'\];/.test(src), true);
-is('  it is told what it may do', /'--allowedTools',\s*'mcp__workspace__\*',\s*'Bash\(curl \*\)'/.test(src), true);
+is('a run keeps the bypass, or token calls are refused as simple_expansion', /const a = \['-p', '--dangerously-skip-permissions'\];/.test(src), true);
+is('  and no allow list, which refuses $VAR in a command', !/'--allowedTools',\s*'mcp__workspace__/.test(src), true);
 is('  and what it may never do', /'Bash\(rm \*\)', 'Bash\(sudo \*\)', 'Bash\(git \*\)', 'Bash\(wrangler \*\)'/.test(src), true);
 is('effort is passed when chosen, and only then', /if \(meter && effort\) a\.push\('--effort', effort\)/.test(src), true);
 is('  after validation', /\/\^\(low\|medium\|high\|max\)\$\/\.test\(String\(args\?\.effort/.test(src), true);
