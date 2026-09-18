@@ -39,11 +39,20 @@ export function makeNarrator(step) {
         cur = t === 'thinking' ? { id: ++block, kind: 'thinking' }
           : t === 'text' ? { id: ++block, kind: 'say' }
             : null;
+        /* THE REASONING ITSELF IS WITHHELD. In print mode the CLI streams a
+         * thinking block whose deltas are empty and whose signature is all
+         * that arrives (measured 2026-09-18, 2.1.275): the model IS thinking,
+         * and that is all anyone outside is told. So the block's start is
+         * narrated as the state it is, and any text that does arrive - a
+         * future CLI, a different model - is appended to the same block. */
+        if (t === 'thinking') step('thinking', 'Thinking\u2026', cur.id);
         return;
       }
       if (e.type === 'content_block_delta' && e.delta && cur) {
-        if (e.delta.type === 'thinking_delta' && cur.kind === 'thinking') step('thinking', String(e.delta.thinking || ''), cur.id);
-        else if (e.delta.type === 'text_delta' && cur.kind === 'say') step('say', String(e.delta.text || ''), cur.id);
+        const piece = e.delta.type === 'thinking_delta' ? String(e.delta.thinking || '') : e.delta.type === 'text_delta' ? String(e.delta.text || '') : '';
+        if (!piece) return;                          // today's thinking deltas are empty
+        if (e.delta.type === 'thinking_delta' && cur.kind === 'thinking') step('thinking', piece, cur.id);
+        else if (e.delta.type === 'text_delta' && cur.kind === 'say') step('say', piece, cur.id);
         return;
       }
       if (e.type === 'content_block_stop') { cur = null; }

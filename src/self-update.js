@@ -14,6 +14,7 @@
 // contains a plausible relay. Nothing touches the live install until the new
 // copy is known good, so a truncated download or a bad tarball leaves the
 // working relay exactly where it was.
+import * as inflight from './inflight.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -87,7 +88,10 @@ async function checkOnce() {
     catch (e) { fs.renameSync(old, ROOT); throw e; } // put it back, stay on the working build
     fs.rmSync(old, { recursive: true, force: true });
 
-    log(`updated to ${sha.slice(0, 7)} — restarting`);
+    const busy = inflight.count();
+    if (busy) log(`updated to ${sha.slice(0, 7)} — restarting once ${busy} run${busy === 1 ? '' : 's'} in flight finish`);
+    else log(`updated to ${sha.slice(0, 7)} — restarting`);
+    await inflight.whenIdle();
     process.exit(0); // KeepAlive brings us back on the new code
   } catch (e) {
     log(`update failed, staying on current build: ${e.message}`);

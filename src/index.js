@@ -11,6 +11,7 @@
 //   JG_RELAY_PROJECTS  comma-separated projects this machine serves (e.g. jaagaa,cricket)
 //   JG_PM2_BIN         path to pm2 (default: `pm2` on PATH)
 
+import * as inflight from './inflight.js';
 import WebSocket from 'ws';
 import { reclaimLeakedPreviewTunnels } from './editor/commands.js';
 import os from 'node:os';
@@ -152,15 +153,17 @@ async function runCommand({ id, cmd, args }) {
   }
 }
 
-process.on('SIGINT', () => {
-  log('shutting down');
+/* SAY WHAT A SHUTDOWN COSTS. A relay stopped mid-question (kickstart -k, a
+ * reinstall) takes the question with it, and nothing in the log said so - the
+ * next line was the new process booting. It is named now, with the count. */
+const bye = (sig) => {
+  const busy = inflight.count();
+  log(`shutting down (${sig})${busy ? ` with ${busy} run${busy === 1 ? '' : 's'} in flight — ${busy === 1 ? 'it is' : 'they are'} lost` : ''}`);
   try { ws?.close(); } catch {}
   process.exit(0);
-});
-process.on('SIGTERM', () => {
-  try { ws?.close(); } catch {}
-  process.exit(0);
-});
+};
+process.on('SIGINT', () => bye('SIGINT'));
+process.on('SIGTERM', () => bye('SIGTERM'));
 
 // Sole-ownership re-establishment. Two passes in order, both non-blocking:
 //

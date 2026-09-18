@@ -9,6 +9,7 @@
 // with explicit "not wired yet" errors (M3/M4) so the surface is discoverable.
 
 import { makeNarrator } from './narrate.js';
+import * as inflight from '../inflight.js';
 import os from 'node:os';
 import path from 'node:path';
 import https from 'node:https';
@@ -1616,8 +1617,10 @@ export function makeEditorCommands({ ws, getWs, version }) {
     'relay.restart': async () => {
       // Same reasoning: answer first, exit after. launchd (or systemd) brings
       // it straight back, which is what makes this safe to offer at all.
-      setTimeout(() => process.exit(0), 50);
-      return { restarting: true };
+      // Not while a question is being answered: the child dies with us.
+      const busy = inflight.count();
+      setTimeout(() => { void inflight.whenIdle().then(() => process.exit(0)); }, 50);
+      return { restarting: true, ...(busy ? { after: `${busy} run${busy === 1 ? '' : 's'} in flight` } : {}) };
     },
 
     /* --- agent.run: ONE QUESTION, ONE ANSWER --------------------------------
@@ -1910,7 +1913,11 @@ export function makeEditorCommands({ ws, getWs, version }) {
       // else: not a file, not an argument. Arguments are visible in `ps` to
       // every process on the machine, and a file outlives the run that needed it.
       const runEnv = agentEnv(apiToken ? { JG_API_TOKEN: apiToken, JG_API_BASE: apiBase } : {});
-      return await new Promise((resolve) => {
+      inflight.begin();
+      return await new Promise((resolve0) => {
+        // Counted out on every exit: answered, killed, failed to start.
+        let settled = false;
+        const resolve = (v) => { if (!settled) { settled = true; inflight.end(); } resolve0(v); };
         let child;
         try { child = spawn(bin, argv, { cwd, env: runEnv, stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] }); }
         catch (e) { return void resolve({ ok: false, error: `failed to start ${bin}: ${e.message}` }); }

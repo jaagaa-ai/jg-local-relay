@@ -35,10 +35,13 @@ const se = (event) => ({ type: 'stream_event', event });
     ] } },
     { type: 'user', message: { content: [{ type: 'tool_result', content: 'ok  fine', is_error: false }] } },
   ]);
-  is('thinking arrives as deltas of one block', out.slice(0, 2), [{ kind: 'thinking', text: 'Let me ', block: 1 }, { kind: 'thinking', text: 'look.', block: 1 }]);
-  is('  and the answer as deltas of the next', out.slice(2, 4), [{ kind: 'say', text: 'There are ', block: 2 }, { kind: 'say', text: '3.', block: 2 }]);
-  is('the whole message adds only the tool call', out.slice(4), [{ kind: 'tool', text: 'Bash — curl /api/x' }, { kind: 'result', text: 'ok fine' }]);
-  is('  nothing is told twice', out.length, 6);
+  is('a thinking block is announced as a state, then its deltas join it', out.slice(0, 3), [{ kind: 'thinking', text: 'Thinking…', block: 1 }, { kind: 'thinking', text: 'Let me ', block: 1 }, { kind: 'thinking', text: 'look.', block: 1 }]);
+  is('  and the answer as deltas of the next', out.slice(3, 5), [{ kind: 'say', text: 'There are ', block: 2 }, { kind: 'say', text: '3.', block: 2 }]);
+  is('the whole message adds only the tool call', out.slice(5), [{ kind: 'tool', text: 'Bash — curl /api/x' }, { kind: 'result', text: 'ok fine' }]);
+  is('  nothing is told twice', out.length, 7);
+  // What the CLI actually sends today: a thinking block with empty deltas.
+  const empty = feed([se({ type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }), se({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '' } }), se({ type: 'content_block_stop', index: 0 })]).out;
+  is('an empty thinking block still shows as thinking', empty, [{ kind: 'thinking', text: 'Thinking…', block: 1 }]);
   is('the model is read off the stream', n.model(), 'claude-opus-5');
   is('  and the run knows it streamed', n.streamed(), true);
 }
@@ -71,5 +74,22 @@ is('effort is passed when chosen, and only then', /if \(meter && effort\) a\.pus
 is('  after validation', /\/\^\(low\|medium\|high\|max\)\$\/\.test\(String\(args\?\.effort/.test(src), true);
 is('deltas of one block are joined inside a batch', /last\.block === block && last\.kind === kind/.test(src), true);
 is('a killed run hands back the answer so far', /said\.trim\(\)\s*\?\s*`\$\{said\.trim\(\)\}/.test(src), true);
+// A RESTART WAITS FOR THE QUESTION. Every path that exits the process asks the
+// in-flight count first; the count is kept by agent.run on every way out.
+import * as inflight from '../src/inflight.js';
+inflight.begin(); inflight.begin(); inflight.end();
+is('runs are counted in and out', inflight.count(), 1);
+const t0 = Date.now(); await inflight.whenIdle(300);
+is('  whenIdle gives up after its ceiling when a run never ends', Date.now() - t0 >= 250, true);
+inflight.end();
+is('  and returns at once when nothing is in flight', await inflight.whenIdle(5000), 0);
+const cmd = readFileSync(new URL('../src/editor/commands.js', import.meta.url), 'utf8');
+const upd = readFileSync(new URL('../src/self-update.js', import.meta.url), 'utf8');
+const idx = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+is('agent.run counts itself in', /inflight\.begin\(\);\s*return await new Promise\(\(resolve0\)/.test(cmd), true);
+is('  and out on every exit', /const resolve = \(v\) => \{ if \(!settled\) \{ settled = true; inflight\.end\(\); \} resolve0\(v\); \};/.test(cmd), true);
+is('the console restart waits for idle', /inflight\.whenIdle\(\)\.then\(\(\) => process\.exit\(0\)\)/.test(cmd), true);
+is('the self-update waits for idle', /await inflight\.whenIdle\(\);\s*process\.exit\(0\);/.test(upd), true);
+is('a signal says what it costs', /shutting down \(\$\{sig\}\)\$\{busy \? ` with \$\{busy\} run/.test(idx), true);
 console.log(fails ? `\n${fails} FAILED` : '\nall ok');
 process.exit(fails ? 1 : 0);
