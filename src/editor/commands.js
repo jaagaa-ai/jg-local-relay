@@ -263,6 +263,14 @@ function buildAgentRun({ cli, prompt, convId, convName, resume, started, model, 
        * partial messages the thinking and the answer come a few tokens at a
        * time, and the reader watches the run rather than a step count. */
       if (meter) a.push('--include-partial-messages');
+      /* NONE OF THE OWNER'S OWN SETUP. The run is a `claude` under the machine
+       * owner's account, so it inherited everything in their ~/.claude - their
+       * skills, slash commands, hooks, CLAUDE.md. Asked for a payment total, it
+       * chose the owner's local "reconciliation" skill over the tenant API and
+       * spent 76 seconds timing out on a database this machine could not reach
+       * (2026-09-18). The agent is a client of the tenant's API and nothing
+       * else: project settings only (the workspace has none), and no skills. */
+      if (meter) a.push('--setting-sources', 'project', '--disable-slash-commands');
       /* HOW HARD TO THINK. Most of a run is model time, and most of that is
        * reasoning; the CLI takes a level for it. Sent only when the reader
        * chose one — the machine's default is the default. */
@@ -1944,10 +1952,14 @@ export function makeEditorCommands({ ws, getWs, version }) {
          * setting, not an answer. Every assistant event carries the real one,
          * so it is read from the run rather than assumed from the request. */
         let usedModel = null;
+        let sentSteps = 0;
         const flush = () => {
           flushTimer = null;
           if (!batch.length) return;
           const steps = batch; batch = [];
+          // The log says the frames LEFT here; if the panel shows nothing, look downstream.
+          if (sentSteps === 0) alog(`first progress after ${Date.now() - _t0}ms (${steps.length} step${steps.length === 1 ? '' : 's'}, ${steps[0].kind})`);
+          sentSteps += steps.length;
           try { ctx.send({ type: 'progress', id: ctx.id, steps }); } catch { /* the run matters more */ }
         };
         /* WHAT IT HAS SAID SO FAR — the answer as it is being written. When a
@@ -2036,7 +2048,7 @@ export function makeEditorCommands({ ws, getWs, version }) {
           // Anything narrated in the last few hundred ms still belongs to the run.
           clearTimeout(flushTimer); flush();
           alog(`done exit=${exitCode} in ${Math.round((Date.now() - _t0) / 1000)}s`
-            + ` out=${out.length}b err=${err.length}b${truncated ? ' (truncated)' : ''}`);
+            + ` out=${out.length}b err=${err.length}b${truncated ? ' (truncated)' : ''} progress=${sentSteps} steps`);
           /* A CREDENTIAL THAT EXISTS IS NOT A CREDENTIAL THAT WORKS.
            *
            * agent.status answers "is there a sign-in" by looking for a keychain

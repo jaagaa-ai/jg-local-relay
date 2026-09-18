@@ -70,6 +70,8 @@ const se = (event) => ({ type: 'stream_event', event });
 import { readFileSync } from 'node:fs';
 const src = readFileSync(new URL('../src/editor/commands.js', import.meta.url), 'utf8');
 is('partials are asked for', /a\.push\('--include-partial-messages'\)/.test(src), true);
+is('the owner\'s own skills, commands and hooks stay out of the run', /a\.push\('--setting-sources', 'project', '--disable-slash-commands'\)/.test(src), true);
+is('the log says when the first progress frame left', /first progress after/.test(src), true);
 is('effort is passed when chosen, and only then', /if \(meter && effort\) a\.push\('--effort', effort\)/.test(src), true);
 is('  after validation', /\/\^\(low\|medium\|high\|max\)\$\/\.test\(String\(args\?\.effort/.test(src), true);
 is('deltas of one block are joined inside a batch', /last\.block === block && last\.kind === kind/.test(src), true);
