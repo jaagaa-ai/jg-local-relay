@@ -1710,7 +1710,7 @@ export function makeEditorCommands({ ws, getWs, version }) {
       // workspace says what things are called, not whether the answer has to be
       // true.
       const head = `${HOUSE_RULES}\n\n---\n\n` + (sysP ? `${sysP}\n\n---\n\n` : '');
-      const prompt = convo
+      let prompt = convo
         ? `${head}Earlier in this conversation:\n\n${convo}\n\n---\n\nAdmin: ${asked}`
         : `${head}${asked}`;
       const app = /^[a-z][a-z0-9-]{0,30}$/.test(String(args?.app || '')) ? String(args.app) : null;
@@ -1941,6 +1941,34 @@ export function makeEditorCommands({ ws, getWs, version }) {
             },
           }), { mode: 0o600 });
         } catch { mcpCfg = null; }
+      }
+      /* FILES THE ADMIN ATTACHED - a pasted screenshot, a dropped PDF. Fetched
+       * with the run's own key (the same person who attached them) into
+       * ./attachments, where the CLI's Read tool can see an image or read a
+       * PDF. A file that will not download is named as missing rather than
+       * dropped, so the answer can say so. */
+      const atts = Array.isArray(args?.attachments) ? args.attachments.slice(0, 5) : [];
+      if (atts.length && apiToken) {
+        const dir = path.join(cwd, 'attachments');
+        try { mkdirSync(dir, { recursive: true }); } catch { /* reported per file below */ }
+        const got = [], missing = [];
+        for (const a of atts) {
+          const name = String(a?.name || 'file').replace(/[\\/\u0000-\u001f]/g, '_').slice(0, 120) || 'file';
+          try {
+            const u = new URL(String(a?.url || ''));
+            if (apiBase && u.origin !== new URL(apiBase).origin) throw new Error('not this workspace');
+            const r = await fetch(u, { headers: { authorization: `Bearer ${apiToken}` }, signal: AbortSignal.timeout(30_000) });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const buf = Buffer.from(await r.arrayBuffer());
+            if (buf.length > 20 * 1024 * 1024) throw new Error('over 20 MB');
+            writeFileSync(path.join(dir, name), buf);
+            got.push(`./attachments/${name}${a?.mime ? ` (${a.mime})` : ''}`);
+          } catch (e) { missing.push(`${name} (${e?.message || e})`); }
+        }
+        alog(`attachments: ${got.length} fetched${missing.length ? `, ${missing.length} missing` : ''}`);
+        prompt += `\n\n---\n\nThe admin attached ${atts.length} file${atts.length === 1 ? '' : 's'} to this question.`
+          + (got.length ? ` Read ${got.length === 1 ? 'it' : 'them'} with your Read tool before answering: ${got.join(', ')}.` : '')
+          + (missing.length ? ` These could not be fetched - say so in your answer: ${missing.join(', ')}.` : '');
       }
       const { bin, argv, stdin } = buildAgentRun({
         cli, prompt, convId: null, convName: null, resume: false, started: false, model, meter, mcpCfg, effort,
